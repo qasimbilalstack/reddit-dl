@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: reddit-dl
+Version: 0.1
+Summary: A minimal gallery-dl fork focused on Reddit extraction
+Requires-Dist: requests>=2.0
+Dynamic: requires-dist
+Dynamic: summary

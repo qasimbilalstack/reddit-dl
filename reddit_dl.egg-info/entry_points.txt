@@ -1,0 +1,2 @@
+[console_scripts]
+reddit-dl = reddit_dl.extractor:main
