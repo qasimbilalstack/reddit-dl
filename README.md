@@ -69,10 +69,6 @@ Command-line usage
 The extractor exposes the following CLI signature (long form):
 
 ```
-usage: extractor.py [-h] [--config CONFIG] [--retry-failed] [--max-posts MAX_POSTS] [--all] [--force] [--no-head-check]
-                    [--save-interval SAVE_INTERVAL] [--partial-fingerprint] [--partial-size PARTIAL_SIZE] [--debug]
-                    urls [urls ...]
-
 reddit-dl: download media from reddit URLs (minimal)
 
 positional arguments:
