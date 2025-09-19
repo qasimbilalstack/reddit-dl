@@ -656,12 +656,12 @@ def fetch_posts_with_pagination(url: str, token: Optional[str], user_agent: str,
     # permalink: do not paginate
     if re.search(r"/comments/", url):
         j = fetch_json(url, token, user_agent)
-        return list(extract_posts(j))
+        return list(extract_posts(j)), 1
 
     # If not asked to paginate, preserve existing single-request behavior
     if not paginate:
         j = fetch_json(url, token, user_agent)
-        return list(extract_posts(j))
+        return list(extract_posts(j)), 1
 
     # Build a base .json URL without querystring
     parts = urlsplit(url)
