@@ -865,7 +865,10 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="reddit-dl: download media from reddit URLs (minimal)")
-    p.add_argument("urls", nargs="+", help="One or more reddit URLs (user, subreddit, permalink)")
+    p.add_argument("urls", nargs="*", help="One or more reddit URLs (user, subreddit, permalink)")
+    p.add_argument("--subreddit", "-r", action="append", help="Subreddit name(s) to fetch (comma-separated or repeat flag)")
+    p.add_argument("--user", "-u", action="append", help="Reddit username(s) to fetch (comma-separated or repeat flag)")
+    p.add_argument("--postid", "-p", action="append", help="Post ID(s) to fetch (comma-separated or repeat flag). Expands to permalink URLs")
     p.add_argument("--config", "-c", help="Path to config JSON (optional)")
     p.add_argument("--retry-failed", action="store_true", help="Retry previously failed downloads from the output directory")
     p.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to fetch (when paginating).")
@@ -1006,7 +1009,37 @@ def main(argv=None):
     concurrency = int(os.environ.get("REDDIT_DL_CONCURRENCY") or reddit_cfg.get("concurrency") or 4)
     rate = float(os.environ.get("REDDIT_DL_RATE") or reddit_cfg.get("rate") or 4.0)
 
-    for url in args.urls:
+    # Normalize and expand explicit flags into canonical reddit URLs
+    urls_to_process = list(args.urls or [])
+    # --user values map to https://www.reddit.com/user/<user>/
+    if getattr(args, "user", None):
+        for user_arg in args.user:
+            # Support comma-separated values
+            for u in user_arg.split(','):
+                if u.strip():
+                    uname = u.strip().lstrip("/@ ")
+                    urls_to_process.append(f"https://www.reddit.com/user/{uname}/")
+    # --subreddit values map to https://www.reddit.com/r/<subreddit>/
+    if getattr(args, "subreddit", None):
+        for sub_arg in args.subreddit:
+            # Support comma-separated values
+            for r in sub_arg.split(','):
+                if r.strip():
+                    rname = r.strip().lstrip("/ r")
+                    urls_to_process.append(f"https://www.reddit.com/r/{rname}/")
+    # --postid values map to https://www.reddit.com/comments/<postid>/
+    if getattr(args, "postid", None):
+        for post_arg in args.postid:
+            # Support comma-separated values
+            for pid in post_arg.split(','):
+                if pid.strip():
+                    pid_clean = pid.strip()
+                    # if full id like t3_xxx given, accept the suffix
+                    if pid_clean.startswith("t3_"):
+                        pid_clean = pid_clean[3:]
+                    urls_to_process.append(f"https://www.reddit.com/comments/{pid_clean}/")
+
+    for url in urls_to_process:
         # decide whether to paginate
         paginate = bool(args.all or args.max_posts)
         try:

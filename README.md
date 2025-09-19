@@ -196,6 +196,14 @@ Supported URL formats:
 | `-c, --config CONFIG` | Path to configuration JSON file |
 | `--debug` | Enable debug logging output |
 
+#### Source Selection
+
+| Option | Description |
+|--------|-------------|
+| `-u, --user USER` | Reddit username(s) to fetch (comma-separated or repeat flag) |
+| `-r, --subreddit SUBREDDIT` | Subreddit name(s) to fetch (comma-separated or repeat flag) |
+| `-p, --postid POSTID` | Post ID(s) to fetch (comma-separated or repeat flag) |
+
 #### Download Control
 
 | Option | Description |
@@ -221,11 +229,22 @@ Supported URL formats:
 Download recent posts from a user:
 ```bash
 reddit-dl --config config.json "https://www.reddit.com/user/SomeUser/"
+# Or using the --user flag:
+reddit-dl --config config.json --user SomeUser
 ```
 
 Download from a subreddit:
 ```bash
 reddit-dl --config config.json "https://www.reddit.com/r/earthporn/"
+# Or using the --subreddit flag:
+reddit-dl --config config.json --subreddit earthporn
+```
+
+Download a specific post:
+```bash
+reddit-dl --config config.json "https://www.reddit.com/r/pics/comments/abc123/..."
+# Or using the --postid flag:
+reddit-dl --config config.json --postid abc123
 ```
 
 ### Advanced Usage
@@ -236,12 +255,35 @@ reddit-dl --config config.json --all \
   "https://www.reddit.com/user/User1/" \
   "https://www.reddit.com/r/subreddit1/" \
   "https://www.reddit.com/r/subreddit2/"
+
+# Or using flags (can mix and match):
+reddit-dl --config config.json --all \
+  --user User1,User2 \
+  --subreddit subreddit1,subreddit2
+```
+
+Download from multiple users and subreddits:
+```bash
+# Using comma-separated lists (recommended):
+reddit-dl --config config.json \
+  --user User1,User2,User3 \
+  --subreddit pics,funny,aww \
+  --postid abc123,def456
+
+# Or using repeated flags:
+reddit-dl --config config.json \
+  --user User1 --user User2 \
+  --subreddit pics --subreddit funny \
+  --postid abc123 --postid def456
 ```
 
 Limit downloads and enable debug logging:
 ```bash
 reddit-dl --config config.json --max-posts 50 --debug \
   "https://www.reddit.com/user/SomeUser/"
+
+# Or with flags:
+reddit-dl --config config.json --max-posts 50 --debug --user SomeUser
 ```
 
 Force re-download with custom fingerprinting:
@@ -268,6 +310,25 @@ EOF
 
 # Process all URLs
 xargs -I {} reddit-dl --config config.json {} < urls.txt
+```
+
+Process multiple sources using flags:
+```bash
+# Download from multiple users and subreddits in one command (recommended):
+reddit-dl --config config.json \
+  --user User1,User2,User3 \
+  --subreddit pics,funny,aww
+
+# Or using repeated flags:
+reddit-dl --config config.json \
+  --user User1 --user User2 --user User3 \
+  --subreddit pics --subreddit funny --subreddit aww
+
+# Mix URLs and flags:
+reddit-dl --config config.json \
+  "https://www.reddit.com/user/SpecialUser/" \
+  --subreddit earthporn,wallpapers \
+  --postid abc123,def456
 ```
 
 ### Output Structure
