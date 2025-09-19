@@ -126,26 +126,6 @@ reddit-dl --config config.json "https://www.reddit.com/user/SomeUser/"
 
 Files will be saved to `downloads/` with organized subfolders and detailed logs in `downloads/logs.txt`.
 
-## Configuration
-
-### Basic Configuration
-
-The minimal configuration requires OAuth credentials:
-
-```json
-{
-  "extractor": {
-    "reddit": {
-      "oauth": {
-        "client_id": "YOUR_CLIENT_ID",
-        "client_secret": "YOUR_CLIENT_SECRET", 
-        "username": "YOUR_REDDIT_USERNAME",
-        "password": "YOUR_REDDIT_PASSWORD"
-      }
-    }
-  }
-}
-```
 
 ### Advanced Configuration Options
 
