@@ -203,7 +203,6 @@ Supported URL formats:
 | `-u, --user USER` | Reddit username(s) to fetch (comma-separated or repeat flag) |
 | `-r, --subreddit SUBREDDIT` | Subreddit name(s) to fetch (comma-separated or repeat flag) |
 | `-p, --postid POSTID` | Post ID(s) to fetch (comma-separated or repeat flag) |
-
 #### Download Control
 
 | Option | Description |
@@ -255,7 +254,6 @@ reddit-dl --config config.json --all \
   "https://www.reddit.com/user/User1/" \
   "https://www.reddit.com/r/subreddit1/" \
   "https://www.reddit.com/r/subreddit2/"
-
 # Or using flags (can mix and match):
 reddit-dl --config config.json --all \
   --user User1,User2 \
@@ -281,7 +279,6 @@ Limit downloads and enable debug logging:
 ```bash
 reddit-dl --config config.json --max-posts 50 --debug \
   "https://www.reddit.com/user/SomeUser/"
-
 # Or with flags:
 reddit-dl --config config.json --max-posts 50 --debug --user SomeUser
 ```
@@ -330,7 +327,6 @@ reddit-dl --config config.json \
   --subreddit earthporn,wallpapers \
   --postid abc123,def456
 ```
-
 ### Output Structure
 
 Downloaded files are organized as follows:
