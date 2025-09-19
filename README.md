@@ -35,6 +35,86 @@ Notes:
 - You can also run the module directly with `python -m reddit_dl.extractor` or install the package
   with `pip install -e .` and use the `reddit-dl` entry point.
 
+Installation
+------------
+
+Install locally in editable mode (recommended during development):
+
+```bash
+python -m pip install -e .
+```
+
+Install from the GitHub repository (latest commit):
+
+```bash
+python -m pip install "git+https://github.com/qasimbilalstack/reddit-dl.git"
+```
+
+Use a virtual environment or pipx for isolation:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+
+# or with pipx
+python -m pip install --user pipx
+python -m pipx ensurepath
+pipx install --editable .
+```
+
+Command-line usage
+------------------
+
+The extractor exposes the following CLI signature (long form):
+
+```
+usage: extractor.py [-h] [--config CONFIG] [--retry-failed] [--max-posts MAX_POSTS] [--all] [--force] [--no-head-check]
+                    [--save-interval SAVE_INTERVAL] [--partial-fingerprint] [--partial-size PARTIAL_SIZE] [--debug]
+                    urls [urls ...]
+
+reddit-dl: download media from reddit URLs (minimal)
+
+positional arguments:
+  urls                  One or more reddit URLs (user, subreddit, permalink)
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG, -c CONFIG
+                        Path to config JSON (optional)
+  --retry-failed        Retry previously failed downloads from the output directory
+  --max-posts MAX_POSTS
+                        Maximum number of posts to fetch (when paginating).
+  --all                 Fetch all posts by following pagination until exhausted.
+  --force               Force re-download even if MD5/index indicates file exists.
+  --no-head-check       Disable HEAD-based checks (enabled by default)
+  --save-interval SAVE_INTERVAL
+                        Persist md5 DB every N md5 updates (default: 10)
+  --partial-fingerprint
+                        Enable optional partial-range fingerprinting to strengthen skip heuristics
+  --partial-size PARTIAL_SIZE
+                        Number of bytes to fetch for partial fingerprint (default: 65536)
+  --debug               Enable debug logging
+```
+
+You can run the same via the installed entry point `reddit-dl` or directly with the module:
+
+```bash
+reddit-dl --config config.json --max-posts 50 "https://www.reddit.com/user/SomeUser/"
+# or
+python -m reddit_dl.extractor --config config.json --all "https://www.reddit.com/r/SomeSub/"
+```
+
+Most commonly used options:
+- `--config CONFIG` : Path to `config.json` containing OAuth keys.
+- `--max-posts N` : Limit number of posts fetched per source (useful for testing).
+- `--all` : Follow pagination and fetch the entire history for each source.
+- `--force` : Force re-download even if dedupe indicates file exists.
+- `--no-head-check` : Skip HEAD/ETag checks (may cause unnecessary downloads).
+- `--partial-fingerprint` / `--partial-size` : Enable partial-range fingerprinting heuristics.
+- `--debug` : Enable verbose debug logging.
+
+
 Example config (config.example.json)
 
 ```json
@@ -52,9 +132,5 @@ Example config (config.example.json)
 }
 ```
 
-Test URLs:
-- https://www.reddit.com/user/SecretKumchie/
-- https://www.reddit.com/r/GreekCelebs/
-- https://www.reddit.com/user/ressaxxx/comments/1nhy77z/front_or_back/
 
 License: see original gallery-dl for licensing. This repo is intended as a focused extractor for Reddit.

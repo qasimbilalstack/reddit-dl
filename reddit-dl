@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Portable wrapper so users can run either:
+
+	./reddit-dl --args...
+	python reddit-dl --args...
+
+This simply forwards arguments to the module `reddit_dl.extractor`.
+"""
+import os
+import sys
+
+# Prefer the current interpreter
+py = sys.executable
+args = [py, "-m", "reddit_dl.extractor"] + sys.argv[1:]
+# Replace the current process
+os.execv(py, args)
