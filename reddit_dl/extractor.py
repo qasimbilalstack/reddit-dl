@@ -9,6 +9,7 @@
 from __future__ import annotations
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -368,8 +369,8 @@ def get_oauth_token(cfg: Dict) -> Optional[str]:
         r.raise_for_status()
     except Exception as exc:
         # don't crash the whole program on token failure; return None so we fall back to unauthenticated
-        print(f"Warning: failed to obtain OAuth token: {exc}", file=sys.stderr)
-        print("Hint: create a Reddit app (script or confidential client) and set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in your environment or config.json", file=sys.stderr)
+        logging.getLogger(__name__).warning("Failed to obtain OAuth token: %s", exc)
+        logging.getLogger(__name__).info("Hint: create a Reddit app and set REDDIT_CLIENT_ID/SECRET in env or config.json")
         return None
 
     j = r.json()
@@ -874,6 +875,7 @@ def main(argv=None):
     p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N md5 updates (default: 10)")
     p.add_argument("--partial-fingerprint", action="store_true", help="Enable optional partial-range fingerprinting to strengthen skip heuristics")
     p.add_argument("--partial-size", type=int, default=65536, help="Number of bytes to fetch for partial fingerprint (default: 65536)")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -883,6 +885,24 @@ def main(argv=None):
     token = get_oauth_token(cfg)
 
     all_media = set()
+    # configure logging
+    log_level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
+    # Omit the logger name to keep logs compact (no __main__ prefix)
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)-7s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    # Also write logs to a file under the output directory for persistence
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        log_path = os.path.join(outdir, "logs.txt")
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s : %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        # dedicated file-only logger so we can emit verbose messages to file without cluttering console
+        file_logger = logging.getLogger("reddit_file")
+        file_logger.setLevel(log_level)
+        file_logger.addHandler(file_handler)
+        file_logger.propagate = False
+    except Exception:
+        pass
     stats = {
         "pages_fetched": 0,
         "posts_processed": 0,
@@ -900,9 +920,10 @@ def main(argv=None):
     # migrate existing JSON index into sqlite if present
     try:
         idx = Md5Index(md5_sql_path)
-        idx.migrate_from_json(md5_db_path)
     except Exception:
         idx = None
+    # Note: legacy JSON->SQLite migration removed. If you need to import an old
+    # `.md5_index.json` file, run a one-time migration tool separately.
 
     # control periodic persistence (sqlite commits are immediate; save_interval kept for compatibility)
     downloads_since_save = 0
@@ -922,7 +943,7 @@ def main(argv=None):
                 if fname.endswith(".failed"):
                     failed_files.append(os.path.join(root, fname))
         if failed_files:
-            print(f"Retrying {len(failed_files)} failed downloads from {outdir}...")
+            logging.getLogger(__name__).info("Retrying %d failed downloads from %s...", len(failed_files), outdir)
             for fpath in failed_files:
                 try:
                     with open(fpath, "r", encoding="utf-8") as fh:
@@ -940,7 +961,7 @@ def main(argv=None):
                         try:
                             os.remove(fpath)
                             stats["recovered"] += 1
-                            print(f"Already present, removed failed marker: {candidate}")
+                            logging.getLogger(__name__).info("Already present, removed failed marker: %s", candidate)
                         except Exception:
                             pass
                         continue
@@ -948,12 +969,33 @@ def main(argv=None):
                         orig = candidate
                 # otherwise, fallback to writing into top-level outdir preserving previous behavior
                 target = orig or os.path.join(outdir, os.path.basename(url))
-                print(f"Retrying: {url} -> {target}")
+                fname = os.path.basename(target)
+                try:
+                    from urllib.parse import urlparse
+
+                    hostname = (urlparse(url).hostname or "") if url else ""
+                    parts = hostname.split('.') if hostname else []
+                    host = '.'.join(parts[-2:]) if len(parts) >= 2 else (hostname or 'unknown')
+                except Exception:
+                    host = 'unknown'
+                logging.getLogger(__name__).info("Retrying: %s | %s", host, fname)
+                try:
+                    logging.getLogger('reddit_file').info(f"Retrying : {url} -> {target}")
+                except Exception:
+                    pass
                 dest = download_url(url, outdir, token=token, user_agent=user_agent, target_path=target)
                 if dest.endswith(".failed"):
-                    print(f"Still failed: {url} -> {dest}")
+                    logging.getLogger(__name__).warning("Still failed: %s | %s", host, os.path.basename(dest))
+                    try:
+                        logging.getLogger('reddit_file').warning(f"Still failed: {url} -> {dest}")
+                    except Exception:
+                        pass
                 else:
-                    print(f"Recovered: {url} -> {dest}")
+                    logging.getLogger(__name__).info("Recovered: %s | %s", host, os.path.basename(dest))
+                    try:
+                        logging.getLogger('reddit_file').info(f"Recovered: {url} -> {dest}")
+                    except Exception:
+                        pass
                     stats["recovered"] += 1
                     try:
                         os.remove(fpath)
@@ -971,20 +1013,49 @@ def main(argv=None):
             posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=paginate, max_posts=args.max_posts, per_page=100)
             stats["pages_fetched"] += pages
         except Exception as e:
-            print(f"Failed to fetch {url}: {e}", file=sys.stderr)
+            logging.getLogger(__name__).warning("Failed to fetch %s: %s", url, e)
             continue
 
         source_name = get_source_name(url)
         source_dir = os.path.join(outdir, source_name)
         os.makedirs(source_dir, exist_ok=True)
+        # Cleanup any previously-saved per-post JSON files that are actually comments
+        # (comments can appear in some listing responses and produce noisy "No media" messages).
+        try:
+            for fname in os.listdir(source_dir):
+                if not fname.endswith('.json'):
+                    continue
+                fpath = os.path.join(source_dir, fname)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as fh:
+                        doc = json.load(fh)
+                    # Heuristic: comment objects often have 'body' and 'link_id'/'parent_id'
+                    if isinstance(doc, dict) and ('body' in doc and (doc.get('link_id') or doc.get('parent_id'))):
+                        try:
+                            os.remove(fpath)
+                            try:
+                                logging.getLogger('reddit_file').info(f"Removed comment metadata (no media) : {fpath}")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                except Exception:
+                    # ignore unreadable files
+                    continue
+        except Exception:
+            pass
         if not posts:
-            print(f"No posts found for {url}")
+            logging.getLogger(__name__).info("No posts found for %s", url)
             continue
 
-        print(f"Found {len(posts)} posts for {url}; saving metadata and media to {source_dir}")
+        logger = logging.getLogger(__name__)
+        logger.info("Found %d posts for %s", len(posts), url)
+        logger.info("Saving metadata and media to %s", source_dir)
         stats["posts_processed"] += len(posts)
 
-        # For each post, save post JSON and download its media into a per-post folder
+        # For each post, optionally save post JSON and download its media into the source root
+        # (metadata and media files will be placed directly under `source_dir`).
+        # Avoid writing per-post JSON for comment nodes (they produce noisy "No media" lines).
         post_urls_map = {}
         for child in posts:
             pdata = child.get("data", {})
@@ -992,39 +1063,73 @@ def main(argv=None):
             if not post_id:
                 # skip anomalous entries
                 continue
-            post_folder = os.path.join(source_dir, _sanitize_filename(post_id))
-            os.makedirs(post_folder, exist_ok=True)
-            # save post JSON
-            meta_path = os.path.join(post_folder, f"{_sanitize_filename(post_id)}.json")
-            try:
-                with open(meta_path, "w", encoding="utf-8") as fh:
-                    json.dump(pdata, fh, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"Warning: failed to write metadata for {post_id}: {e}", file=sys.stderr)
 
             # collect media for this post
             media_urls = collect_media_from_post(child)
+
+            # Heuristic: only write per-post metadata JSON when the item looks like a submission
+            # that could have media. This avoids creating JSON files for comment nodes.
+            looks_like_submission = False
+            try:
+                # common submission keys indicating possible media or a submission
+                if any(k in pdata for k in ("url", "url_overridden_by_dest", "media_metadata", "secure_media", "preview", "is_gallery")):
+                    looks_like_submission = True
+                # also treat items with 'link_id' pointing to a post as comments -> skip
+                if pdata.get("link_id") and pdata.get("parent_id") and pdata.get("author") and not pdata.get("is_submitter"):
+                    # likely a comment; don't treat as submission
+                    looks_like_submission = False
+            except Exception:
+                looks_like_submission = bool(media_urls)
+
+            meta_path = None
+            if looks_like_submission:
+                meta_path = os.path.join(source_dir, f"{_sanitize_filename(post_id)}.json")
+                try:
+                    with open(meta_path, "w", encoding="utf-8") as fh:
+                        json.dump(pdata, fh, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    logging.getLogger(__name__).warning("Failed to write metadata for %s: %s", post_id, e)
+
             if media_urls:
-                # store tuple (post_id, urls) so we can name files using post_id
-                post_urls_map[post_folder] = (post_id, list(media_urls))
+                # store mapping post_id -> (urls, meta_path) so we can delete meta on skip
+                post_urls_map[post_id] = (list(media_urls), meta_path)
 
         # Download media: either parallel across posts and within posts, or sequential per post
         if post_urls_map:
             # Flatten tasks (prefix each url with its target folder and post_id) and download in parallel
             tasks = []
-            for post_folder, (post_id, urls) in post_urls_map.items():
+            for post_id, (urls, meta_path) in post_urls_map.items():
                 for u in urls:
-                    tasks.append((post_folder, post_id, u))
+                    # folder will be source_dir; include meta_path for possible deletion on skip
+                    tasks.append((source_dir, post_id, u, meta_path))
 
-            # post_urls_map values are (post_id, urls)
-            total_media = sum(len(urls) for (_pid, urls) in post_urls_map.values())
-            print(f"Downloading {total_media} media files with concurrency={concurrency}, rate={rate}/s")
+            # post_urls_map values are (urls, meta_path)
+            # compute total_media by summing the length of each urls list
+            total_media = sum(len(urls) for (urls, _meta) in post_urls_map.values())
+            logging.getLogger(__name__).info("Downloading %d media files with concurrency=%s, rate=%s/s", total_media, concurrency, rate)
             stats["media_attempted"] += total_media
             # use thread pool but respect global rate limiter by each worker calling limiter
             limiter = TokenBucket(rate=rate)
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                 def worker_item_with_rate(item):
-                    folder, post_id, u = item
+                    # item is (folder, post_id, url, meta_path)
+                    try:
+                        folder, post_id, u, meta_path = item
+                    except Exception:
+                        # backward compatibility: fallback to older 3-tuple
+                        folder, post_id, u = item
+                        meta_path = None
+                    def _skipped_return(dest):
+                        # when a media is skipped because it already exists, delete the per-post JSON
+                        try:
+                            if meta_path and os.path.exists(meta_path):
+                                try:
+                                    os.remove(meta_path)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        return folder, post_id, u, dest, True
                     nonlocal downloads_since_save
                     limiter.wait_for_token()
                     if args.force:
@@ -1039,7 +1144,7 @@ def main(argv=None):
                                     idx.add_path_for_md5(md5, dst)
                                 except Exception:
                                     pass
-                        return folder, u, dst, False
+                        return folder, post_id, u, dst, False
                     # quick URL-based skip: if we've seen this URL before and it maps to an md5,
                     # and the md5 already exists in our index, skip downloading
                     norm_u = normalize_media_url(u)
@@ -1049,6 +1154,7 @@ def main(argv=None):
                             existing_md5 = idx.get_md5_for_url(norm_u)
                     except Exception:
                         existing_md5 = None
+
                     if existing_md5:
                         # find an existing file path for this md5; if found, copy into per-post folder
                         candidate_paths = []
@@ -1082,13 +1188,13 @@ def main(argv=None):
                                             stats["recovered"] += 1
                                         except Exception:
                                             pass
-                                        return folder, u, target_path, True
+                                        return _skipped_return(target_path)
                                     except Exception:
-                                        return folder, u, found, True
+                                        return _skipped_return(found)
                                 else:
-                                    return folder, u, target_path, True
+                                    return _skipped_return(target_path)
                             except Exception:
-                                return folder, u, found, True
+                                return _skipped_return(found)
                         # No local file exists but md5 is known in the index — respect the index and skip re-download.
                         # Map URL -> md5 in sqlite and return skipped.
                         try:
@@ -1096,7 +1202,7 @@ def main(argv=None):
                                 idx.set_url_md5(norm_u, existing_md5)
                         except Exception:
                             pass
-                        return folder, u, folder, True
+                        return _skipped_return(folder)
 
                     cl = None
                     etag = None
@@ -1116,6 +1222,7 @@ def main(argv=None):
                                 mapped = idx.get_md5_for_etag(etag)
                         except Exception:
                             mapped = None
+
                         if mapped:
                             candidate_paths = []
                             try:
@@ -1153,21 +1260,20 @@ def main(argv=None):
                                                 stats["recovered"] += 1
                                             except Exception:
                                                 pass
-                                            return folder, u, target_path, True
+                                            return _skipped_return(target_path)
                                         except Exception:
-                                            return folder, u, found, True
+                                            return _skipped_return(found)
                                     else:
-                                        return folder, u, target_path, True
+                                        return _skipped_return(target_path)
                                 except Exception:
-                                    return folder, u, found, True
+                                    return _skipped_return(found)
                             # mapped md5 exists but no local path found: skip without creating any marker file
                             try:
                                 if idx:
                                     idx.set_url_md5(norm_u, mapped)
                             except Exception:
                                 pass
-                            return folder, u, folder, True
-
+                            return _skipped_return(folder)
                     # If we don't have a URL or ETag match, and we have a Content-Length, try size-based match
                     if args.head_check and cl:
                         try:
@@ -1185,7 +1291,7 @@ def main(argv=None):
                                                 idx.set_etag_md5(etag, md5)
                                             except Exception:
                                                 pass
-                                        return folder, u, p, True
+                                        return folder, post_id, u, p, True
                                 except Exception:
                                     continue
                         except Exception:
@@ -1238,7 +1344,7 @@ def main(argv=None):
                                                 idx.set_url_md5(norm_u, md5)
                                             except Exception:
                                                 pass
-                                            return folder, u, p, True
+                                            return _skipped_return(p)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1275,16 +1381,17 @@ def main(argv=None):
                                 except Exception:
                                     pass
                                 downloads_since_save = 0
-                    return folder, u, dst, False
+                    return folder, post_id, u, dst, False
 
                 futures = {ex.submit(worker_item_with_rate, item): item for item in tasks}
                 for fut in as_completed(futures):
                     item = futures[fut]
                     try:
-                        folder, url, dest, skipped = fut.result()
+                        folder, post_id, url, dest, skipped = fut.result()
                     except Exception as e:
                         # item is (folder, post_id, url)
                         folder = item[0]
+                        post_id = item[1] if len(item) > 2 else "?"
                         url = item[-1]
                         dest = os.path.join(folder, _sanitize_filename(url) + ".failed")
                         skipped = False
@@ -1294,43 +1401,88 @@ def main(argv=None):
                         except Exception:
                             pass
 
+                    # Pretty host label for logs (e.g., Redgifs, Redd.it)
+                    try:
+                        from urllib.parse import urlparse
+
+                        hostname = (urlparse(url).hostname or "") if url else ""
+                        lh = (hostname or "").lower()
+                        if "redgifs" in lh:
+                            host_label = "Redgifs"
+                        elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                            host_label = "Redd.it"
+                        else:
+                            parts = lh.split(".") if lh else []
+                            if len(parts) >= 2:
+                                sld = parts[-2]
+                                tld = parts[-1]
+                                # show .it tld as Redd.it style, otherwise drop common tlds
+                                if tld == "it":
+                                    host_label = f"{sld.capitalize()}.{tld}"
+                                else:
+                                    host_label = sld.capitalize()
+                            else:
+                                host_label = (lh or "Unknown").capitalize()
+                    except Exception:
+                        host_label = "Unknown"
+
                     if skipped:
-                        print(f"Skipped (already downloaded): {url} -> {dest}")
+                        logging.getLogger(__name__).info("[%s] [%s] Skipped %s", post_id, host_label, os.path.basename(dest))
+                        # verbose file log with full URL -> dest
+                        try:
+                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Skipped already downloaded : {url} -> {dest}")
+                        except Exception:
+                            pass
                         stats["media_skipped"] += 1
                     elif dest.endswith(".failed"):
-                        print(f"Failed to download {url} -> {dest}")
+                        logging.getLogger(__name__).warning("[%s] [%s] Failed %s", post_id, host_label, os.path.basename(dest))
+                        try:
+                            logging.getLogger('reddit_file').warning(f"[{post_id}] [{host_label}] Failed to download : {url} -> {dest}")
+                        except Exception:
+                            pass
                         stats["media_failed"] += 1
                     else:
-                        print(f"Downloaded {url} -> {dest}")
+                        logging.getLogger(__name__).info("[%s] [%s] Downloaded %s", post_id, host_label, os.path.basename(dest))
+                        try:
+                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Downloaded from {url} -> {dest}")
+                        except Exception:
+                            pass
                         stats["media_downloaded"] += 1
                         try:
                             stats["bytes_downloaded"] += os.path.getsize(dest)
                         except Exception:
                             pass
 
-        # update all_media set with each URL (post_urls_map values are (post_id, urls))
-        for (_post_folder, (pid, urls)) in post_urls_map.items():
+        # update all_media set with each URL (post_urls_map items are post_id -> (urls, meta_path))
+        for (pid, (urls, _meta)) in post_urls_map.items():
             for u in urls:
                 all_media.add(u)
 
     if not all_media:
-        print("No media downloaded.")
-    # save md5 db
+        logging.getLogger(__name__).info("No media downloaded.")
+    # checkpoint and close sqlite-backed md5 index if present
     try:
-        with _md5_lock:
-            save_md5_db(md5_db, md5_db_path)
+        if idx:
+            try:
+                idx.checkpoint()
+            except Exception:
+                pass
+            try:
+                idx.close()
+            except Exception:
+                pass
     except Exception:
         pass
     elapsed = time.time() - stats["start_time"]
-    print("\nSummary:")
-    print(f"  Pages fetched: {stats['pages_fetched']}")
-    print(f"  Posts processed: {stats['posts_processed']}")
-    print(f"  Media attempted: {stats['media_attempted']}")
-    print(f"  Media downloaded: {stats['media_downloaded']}")
-    print(f"  Media failed: {stats['media_failed']}")
-    print(f"  Media skipped: {stats.get('media_skipped', 0)}")
-    print(f"  Bytes downloaded: {stats['bytes_downloaded']:,}")
-    print(f"  Elapsed time: {elapsed:.1f}s")
+    logger = logging.getLogger(__name__)
+    # format bytes with thousands separator via f-string to avoid logging format conflicts
+    summary = (
+        f"Summary:\n  Pages fetched: {stats['pages_fetched']}\n  Posts processed: {stats['posts_processed']}\n"
+        f"  Media attempted: {stats['media_attempted']}\n  Media downloaded: {stats['media_downloaded']}\n"
+        f"  Media failed: {stats['media_failed']}\n  Media skipped: {stats.get('media_skipped', 0)}\n"
+        f"  Bytes downloaded: {stats['bytes_downloaded']:,}\n  Elapsed time: {elapsed:.1f}s"
+    )
+    logger.info(summary)
 
 
 if __name__ == "__main__":

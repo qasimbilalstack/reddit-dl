@@ -119,10 +119,15 @@ class Md5Index:
                 pass
 
     def iter_md5_paths(self) -> Iterable[Tuple[str, str]]:
-        with self._lock:
-            cur = self._conn.execute("SELECT md5, path FROM md5_to_paths ORDER BY md5")
-            for md5, path in cur.fetchall():
-                yield md5, path
+        # Fetch a snapshot of rows under the lock, then yield without holding the lock
+        try:
+            with self._lock:
+                cur = self._conn.execute("SELECT md5, path FROM md5_to_paths ORDER BY md5")
+                rows = cur.fetchall()
+        except Exception:
+            rows = []
+        for md5, path in rows:
+            yield md5, path
 
     def has_any_entries(self) -> bool:
         with self._lock:
