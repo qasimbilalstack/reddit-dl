@@ -30,6 +30,31 @@ DEFAULT_USER_AGENT = "reddit-dl/0.1 (by /u/yourusername)"
 _TOKEN_CACHE = {}
 
 
+class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom formatter for better help text alignment and spacing."""
+    
+    def __init__(self, prog, indent_increment=2, max_help_position=24, width=None):
+        super().__init__(prog, indent_increment, max_help_position, width)
+    
+    def _format_action_invocation(self, action):
+        if not action.option_strings:
+            default = self._get_default_metavar_for_positional(action)
+            metavar, = self._metavar_formatter(action, default)(1)
+            return metavar
+        else:
+            parts = []
+            # if the Optional doesn't take a value, format is: -s, --long
+            if action.nargs == 0:
+                parts.extend(action.option_strings)
+            # if the Optional takes a value, format is: -s ARGS, --long ARGS
+            else:
+                default = self._get_default_metavar_for_optional(action)
+                args_string = self._format_args(action, default)
+                for option_string in action.option_strings:
+                    parts.append('%s %s' % (option_string, args_string))
+            return ', '.join(parts)
+
+
 # Disk-backed token cache helpers
 def _default_token_cache_path() -> str:
     # allow override via env var
@@ -864,23 +889,33 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
     return dest
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="reddit-dl: download media from reddit URLs (minimal)")
+    p = argparse.ArgumentParser(
+        prog="reddit-dl",
+        description="reddit-dl: download media from reddit URLs (minimal)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --config config.json --user spez
+  %(prog)s --config config.json --subreddit pics,funny
+  %(prog)s --config config.json --user user1,user2 --subreddit r1,r2
+  %(prog)s --config config.json "https://reddit.com/user/spez/"
+        """.strip()
+    )
     p.add_argument("urls", nargs="*", help="One or more reddit URLs (user, subreddit, permalink)")
-    p.add_argument("--subreddit", "-r", action="append", help="Subreddit name(s) to fetch (comma-separated or repeat flag)")
-    p.add_argument("--user", "-u", action="append", help="Reddit username(s) to fetch (comma-separated or repeat flag)")
-    p.add_argument("--postid", "-p", action="append", help="Post ID(s) to fetch (comma-separated or repeat flag). Expands to permalink URLs")
-    p.add_argument("--config", "-c", help="Path to config JSON (optional)")
-    p.add_argument("--retry-failed", action="store_true", help="Retry previously failed downloads from the output directory")
-    p.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to fetch (when paginating).")
-    p.add_argument("--all", action="store_true", help="Fetch all posts by following pagination until exhausted.")
-    p.add_argument("--force", action="store_true", help="Force re-download even if MD5/index indicates file exists.")
-    p.add_argument("--no-head-check", dest="head_check", action="store_false", help="Disable HEAD-based checks (enabled by default)")
-    p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N md5 updates (default: 10)")
-    p.add_argument("--partial-fingerprint", action="store_true", help="Enable optional partial-range fingerprinting to strengthen skip heuristics")
-    p.add_argument("--partial-size", type=int, default=65536, help="Number of bytes to fetch for partial fingerprint (default: 65536)")
+    p.add_argument("--subreddit", "-r", action="append", help="Subreddit name(s) (comma-separated or repeat flag)")
+    p.add_argument("--user", "-u", action="append", help="Reddit username(s) (comma-separated or repeat flag)")
+    p.add_argument("--postid", "-p", action="append", help="Post ID(s) (comma-separated or repeat flag)")
+    p.add_argument("--config", "-c", help="Path to config JSON file")
+    p.add_argument("--retry-failed", action="store_true", help="Retry previously failed downloads")
+    p.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to fetch")
+    p.add_argument("--all", action="store_true", help="Fetch all posts by following pagination")
+    p.add_argument("--force", action="store_true", help="Force re-download even if file exists")
+    p.add_argument("--no-head-check", dest="head_check", action="store_false", help="Disable HEAD-based checks")
+    p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N updates (default: 10)")
+    p.add_argument("--partial-fingerprint", action="store_true", help="Enable partial-range fingerprinting")
+    p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = p.parse_args(argv)
-
     cfg = load_config(args.config)
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
     user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
