@@ -3,3 +3,4 @@ __pycache__/
 .env
 config.json
 downloads/
+reddit_dl_tokens.json

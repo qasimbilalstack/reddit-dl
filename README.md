@@ -209,6 +209,8 @@ Supported URL formats:
 |--------|-------------|
 | `--max-posts MAX_POSTS` | Maximum number of posts to fetch |
 | `--all` | Fetch all available posts (follow pagination) |
+| `--per-page N` | Number of posts to request per page when paginating (default: 100, max: 100) |
+| `--sort {hot,new,top,rising,best}` | Listing sort order to request from Reddit (default: new) |
 | `--force` | Force re-download existing files |
 | `--retry-failed` | Retry previously failed downloads |
 
@@ -220,6 +222,13 @@ Supported URL formats:
 | `--partial-fingerprint` | Enable partial content fingerprinting |
 | `--partial-size BYTES` | Bytes to fetch for fingerprinting (default: 65536) |
 | `--save-interval N` | Save MD5 database every N updates (default: 10) |
+
+#### Content Control
+
+| Option | Description |
+|--------|-------------|
+| `--no-save-meta` | Do not write per-post metadata JSON files (saves disk and time) |
+| `--comments` | Fetch comments in addition to submissions (disabled by default). Without this flag only submissions are fetched (uses /submitted/ URLs) |
 
 ## Examples
 
@@ -237,6 +246,9 @@ Download from a subreddit:
 reddit-dl --config config.json "https://www.reddit.com/r/earthporn/"
 # Or using the --subreddit flag:
 reddit-dl --config config.json --subreddit earthporn
+
+# Download top posts from a subreddit:
+reddit-dl --config config.json --sort top --subreddit earthporn
 ```
 
 Download a specific post:
@@ -292,6 +304,21 @@ reddit-dl --config config.json --force --partial-fingerprint \
 Retry failed downloads from previous sessions:
 ```bash
 reddit-dl --config config.json --retry-failed
+```
+
+Download with custom sort order and pagination:
+```bash
+# Download top posts with custom page size
+reddit-dl --config config.json --sort top --per-page 50 \
+  "https://www.reddit.com/r/earthporn/"
+
+# Download hot posts without metadata JSON files
+reddit-dl --config config.json --sort hot --no-save-meta \
+  "https://www.reddit.com/user/SomeUser/"
+
+# Download only submissions (comments disabled by default) from multiple users
+reddit-dl --config config.json \
+  --user User1,User2,User3
 ```
 
 ### Batch Processing
@@ -384,6 +411,8 @@ Downloads are slow or timing out
 **Solutions:**
 - Reduce `--max-posts` for testing
 - Enable `--partial-fingerprint` for better deduplication
+- Try `--no-save-meta` to reduce disk I/O
+- Use `--per-page` with smaller values (e.g., 25) for better rate limiting
 - Check network connectivity
 - Monitor Reddit API rate limits
 

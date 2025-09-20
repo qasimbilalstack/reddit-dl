@@ -8,7 +8,11 @@
         "password": "YOUR_REDDIT_PASSWORD"
       },
       "user_agent": "reddit-dl/0.1 by YOUR_USERNAME",
-      "output_dir": "downloads"
+      "output_dir": "downloads",
+      "token_cache": "~/.reddit_dl_tokens.json",
+      "default_max_posts": 1000,
+      "concurrency": 4,
+      "rate": 4.0
     }
   }
 }

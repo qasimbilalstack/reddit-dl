@@ -1048,11 +1048,6 @@ def main(argv=None):
         description="reddit-dl: download media from reddit URLs (minimal)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s --config config.json --user spez
-  %(prog)s --config config.json --subreddit pics,funny
-  %(prog)s --config config.json --user user1,user2 --subreddit r1,r2
-  %(prog)s --config config.json "https://reddit.com/user/spez/"
         """.strip()
     )
     p.add_argument("urls", nargs="*", help="One or more reddit URLs (user, subreddit, permalink)")
@@ -1072,13 +1067,18 @@ Examples:
     p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     p.add_argument("--no-save-meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time)")
-    p.add_argument("--no-comments", action="store_true", help="Do not fetch comments; only fetch submissions (use /submitted/)")
+    p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
     user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
     outdir = reddit_cfg.get("output_dir", "downloads")
     token = get_oauth_token(cfg)
+    # default max posts when neither --max-posts nor --all is provided
+    try:
+        default_max_posts = int(os.environ.get("REDDIT_DL_DEFAULT_MAX_POSTS") or reddit_cfg.get("default_max_posts") or 500)
+    except Exception:
+        default_max_posts = 500
 
     all_media = set()
     # configure logging
@@ -1204,17 +1204,18 @@ Examples:
 
     # Normalize and expand explicit flags into canonical reddit URLs
     urls_to_process = list(args.urls or [])
-    # --user values map to https://www.reddit.com/user/<user>/ or /submitted/ when --no-comments is used
+    # --user values map to https://www.reddit.com/user/<user>/ or /submitted/ when comments are disabled (default)
     if getattr(args, "user", None):
         for user_arg in args.user:
             # Support comma-separated values
             for u in user_arg.split(','):
                 if u.strip():
                     uname = u.strip().lstrip("/@ ")
-                    if getattr(args, "no_comments", False):
-                        urls_to_process.append(f"https://www.reddit.com/user/{uname}/submitted/")
-                    else:
+                    # comments are disabled by default; enable with --comments
+                    if getattr(args, "comments", False):
                         urls_to_process.append(f"https://www.reddit.com/user/{uname}/")
+                    else:
+                        urls_to_process.append(f"https://www.reddit.com/user/{uname}/submitted/")
     # --subreddit values map to https://www.reddit.com/r/<subreddit>/
     if getattr(args, "subreddit", None):
         for sub_arg in args.subreddit:
@@ -1235,8 +1236,8 @@ Examples:
                         pid_clean = pid_clean[3:]
                     urls_to_process.append(f"https://www.reddit.com/comments/{pid_clean}/")
 
-                # If user passed explicit profile URLs and requested no comments, convert to /submitted/
-                if getattr(args, "no_comments", False):
+                # If user passed explicit profile URLs and comments are disabled, convert to /submitted/
+                if not getattr(args, "comments", False):
                     new_urls = []
                     for u in urls_to_process:
                         try:
@@ -1250,10 +1251,26 @@ Examples:
                     urls_to_process = new_urls
 
     for url in urls_to_process:
-        # decide whether to paginate
-        paginate = bool(args.all or args.max_posts)
+        # decide whether to paginate and determine max_posts parameter
+        # Behavior change: when neither --max-posts nor --all is provided, default to
+        # paginating and limit to 500 posts to avoid accidentally fetching only
+        # the first page (previous default behavior).
+        if getattr(args, 'all', False):
+            paginate = True
+            max_posts_param = args.max_posts
+        elif args.max_posts is not None:
+            paginate = True
+            max_posts_param = args.max_posts
+        else:
+            # default: paginate and fetch up to 500 posts
+            paginate = True
+            max_posts_param = 500
+            try:
+                logging.getLogger(__name__).info("No --all or --max-posts provided: defaulting to max_posts=%d", max_posts_param)
+            except Exception:
+                pass
         try:
-            posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=paginate, max_posts=args.max_posts, per_page=args.per_page, debug=getattr(args, 'debug', False), sort=getattr(args, 'sort', None))
+            posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=paginate, max_posts=max_posts_param, per_page=args.per_page, debug=getattr(args, 'debug', False), sort=getattr(args, 'sort', None))
             stats["pages_fetched"] += pages
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to fetch %s: %s", url, e)
