@@ -123,7 +123,8 @@ def load_config(path: Optional[str]) -> Dict:
 
 
 def _default_md5_db_path(outdir: str) -> str:
-    return os.path.join(outdir, ".md5_index.json")
+    # return a base name (without extension) so callers can choose sqlite suffix
+    return os.path.join(outdir, ".md5_index")
 
 
 def normalize_media_url(url: str) -> str:
@@ -425,10 +426,22 @@ def fetch_json(url: str, token: Optional[str], user_agent: str) -> Dict:
     if token:
         headers["Authorization"] = f"bearer {token}"
     # Reddit JSON endpoints: append .json where appropriate
-    if not url.endswith(".json"):
+    # ensure we only inspect the path portion (before any querystring) when
+    # deciding whether to append ".json". Appending to the full URL that
+    # contains a querystring produced invalid urls like 
+    # "/path.json?limit=25.json" which caused the API to ignore pagination.
+    try:
+        base_part = url.split('?', 1)[0]
+    except Exception:
+        base_part = url
+    if not base_part.endswith(".json"):
         # allow passing permalink or listing URL
-        if re.search(r"/comments/|/user/|/r/", url):
-            url = url.rstrip("/") + ".json"
+        if re.search(r"/comments/|/user/|/r/", base_part):
+            # append .json to the path portion and preserve any querystring
+            qs = ''
+            if '?' in url:
+                qs = url.split('?', 1)[1]
+            url = base_part.rstrip("/") + ".json" + (('?' + qs) if qs else '')
 
     # If we have a bearer token, use the OAuth API host which accepts bearer tokens
     if token:
@@ -487,6 +500,23 @@ def collect_media_from_post(post: Dict) -> Set[str]:
             fb = rv.get("fallback_url")
             if fb:
                 return {fb.replace("&amp;", "&")}
+    except Exception:
+        pass
+
+    # Priority 2.5: prefer preview MP4 variant for GIFs (preview.images[].variants.mp4)
+    try:
+        preview = data.get("preview", {})
+        images = preview.get("images", []) if isinstance(preview, dict) else []
+        for img in images:
+            try:
+                variants = img.get("variants") or {}
+                mp4var = variants.get("mp4") if isinstance(variants, dict) else None
+                if isinstance(mp4var, dict):
+                    src = mp4var.get("source", {}).get("url")
+                    if src and isinstance(src, str):
+                        return {src.replace("&amp;", "&")}
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -665,7 +695,7 @@ def extract_posts(json_data: Dict) -> Iterable[Dict]:
     return posts
 
 
-def fetch_posts_with_pagination(url: str, token: Optional[str], user_agent: str, paginate: bool = False, max_posts: Optional[int] = None, per_page: int = 100) -> Tuple[list, int]:
+def fetch_posts_with_pagination(url: str, token: Optional[str], user_agent: str, paginate: bool = False, max_posts: Optional[int] = None, per_page: int = 100, debug: bool = False, sort: Optional[str] = None) -> Tuple[list, int]:
     """Fetch posts for a listing URL, optionally following pagination.
 
     - If `paginate` is False the function will fetch the single JSON page for `url` and
@@ -681,7 +711,16 @@ def fetch_posts_with_pagination(url: str, token: Optional[str], user_agent: str,
     # permalink: do not paginate
     if re.search(r"/comments/", url):
         j = fetch_json(url, token, user_agent)
-        return list(extract_posts(j)), 1
+        # Permalink JSON responses are lists: [post, comments]. Extract only
+        # the first element (the post listing) to avoid counting comment nodes.
+        try:
+            if isinstance(j, list) and len(j) > 0:
+                post_listing = j[0]
+            else:
+                post_listing = j
+            return list(extract_posts(post_listing)), 1
+        except Exception:
+            return list(extract_posts(j)), 1
 
     # If not asked to paginate, preserve existing single-request behavior
     if not paginate:
@@ -691,19 +730,102 @@ def fetch_posts_with_pagination(url: str, token: Optional[str], user_agent: str,
     # Build a base .json URL without querystring
     parts = urlsplit(url)
     path = (parts.path or "").rstrip("/")
+    # include sort as a query parameter when provided (e.g., ?sort=new)
     base_json = urlunsplit((parts.scheme or "https", parts.netloc or "www.reddit.com", path + ".json", "", ""))
+    if sort:
+        # We'll append sort into the per-page query string below (no-op here), but
+        # ensure the caller-specified sort is lowercase and valid.
+        sort = (sort or "").lower()
 
     posts = []
     after = None
-    per_page = int(per_page or 100)
+    # Reddit listing API limits `limit` to a maximum of 100 per request. Clamp the
+    # requested per_page to 100 and emit a warning when a larger value was provided.
+    try:
+        per_page = int(per_page or 100)
+    except Exception:
+        per_page = 100
+    if per_page > 100:
+        logging.getLogger(__name__).warning("Requested per-page=%d exceeds Reddit API max (100); using 100 instead", per_page)
+        per_page = 100
     pages_fetched = 0
+    logger = logging.getLogger(__name__)
+    # estimate pages when max_posts is provided
+    est_pages = None
+    try:
+        if max_posts:
+            from math import ceil
+            est_pages = int(ceil(int(max_posts) / per_page))
+    except Exception:
+        est_pages = None
     while True:
-        q = f"limit={per_page}"
+        # don't request more than remaining when max_posts is set
+        remaining = max_posts - len(posts) if max_posts else None
+        req_limit = per_page if remaining is None else max(1, min(per_page, int(remaining)))
+        q = f"limit={req_limit}"
         if after:
             q = q + f"&after={after}"
+        if sort:
+            try:
+                q = q + f"&sort={sort}"
+            except Exception:
+                pass
         page_url = base_json + "?" + q
         j = fetch_json(page_url, token, user_agent)
         pages_fetched += 1
+        # Count posts returned on this page
+        current_page_posts = 0
+        try:
+            current_page_posts = len(list(extract_posts(j)))
+        except Exception:
+            current_page_posts = 0
+        total_posts_so_far = len(posts) + current_page_posts
+        try:
+            if est_pages:
+                logger.info("Pages fetched: %d / %d — page %d contained %d posts (total so far: %d)", pages_fetched, est_pages, pages_fetched, current_page_posts, total_posts_so_far)
+            else:
+                logger.info("Pages fetched: %d — page %d contained %d posts (total so far: %d)", pages_fetched, pages_fetched, current_page_posts, total_posts_so_far)
+        except Exception:
+            pass
+        # Log short IDs and permalinks for the first few posts on this page (helps verification)
+        try:
+            page_posts = list(extract_posts(j))
+            # Build a list of short display strings for posts on this page.
+            short_list = []
+            try:
+                for idx, item in enumerate(page_posts):
+                    try:
+                        pdata = item.get('data', {})
+                        pid = pdata.get('id') or pdata.get('name') or None
+                        if pid:
+                            short = f"https://redd.it/{pid}"
+                        else:
+                            permalink = pdata.get('permalink') or pdata.get('link_permalink') or pdata.get('url')
+                            if permalink and isinstance(permalink, str):
+                                short = re.sub(r"https?://(www\.)?reddit\.com", "", permalink)
+                            else:
+                                short = None
+                        short_list.append(f"{pid} {short if short else ''}".strip())
+                    except Exception:
+                        continue
+            except Exception:
+                short_list = []
+
+            # Only print per-page samples when debug is enabled. In debug mode we
+            # print the full per-page list; otherwise keep listing output compact.
+            try:
+                if debug and short_list:
+                    # full list at DEBUG
+                    logger.debug("Page %d posts (%d):", pages_fetched, len(short_list))
+                    for s in short_list:
+                        try:
+                            logger.debug("  %s", s)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception:
+            pass
         new_posts = list(extract_posts(j))
         if new_posts:
             posts.extend(new_posts)
@@ -734,7 +856,7 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
     os.makedirs(outdir, exist_ok=True)
     parsed = None
     try:
-        from urllib.parse import urlparse, unquote
+        from urllib.parse import urlparse, unquote, parse_qs
 
         parsed = urlparse(url)
     except Exception:
@@ -749,6 +871,17 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
     if not default_name:
         default_name = "file"
     default_name = _sanitize_filename(unquote(default_name))
+
+    # Detect if the URL declares format=mp4 (preview mp4 variants use format=mp4)
+    override_ext = None
+    try:
+        if parsed and parsed.query:
+            q = parse_qs(parsed.query)
+            fmt = (q.get("format") or q.get("fmt") or [None])[0]
+            if fmt and isinstance(fmt, str) and fmt.lower() == "mp4":
+                override_ext = ".mp4"
+    except Exception:
+        override_ext = None
 
     # if a filename base (post id) was provided, use it (append extension from URL if present)
     if target_path:
@@ -766,6 +899,13 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
             dest = os.path.join(outdir, fname)
     else:
         dest = os.path.join(outdir, default_name)
+        # apply override extension if detected from URL
+        try:
+            if override_ext:
+                base, _ = os.path.splitext(dest)
+                dest = base + override_ext
+        except Exception:
+            pass
 
     headers = {"User-Agent": user_agent}
 
@@ -849,6 +989,20 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             fh.write(chunk)
+                # If the server reports video/mp4, ensure .mp4 extension for dest
+                try:
+                    ctype = r.headers.get("content-type", "").lower()
+                    if "video/mp4" in ctype:
+                        base, ext = os.path.splitext(dest)
+                        if ext.lower() != ".mp4":
+                            newdest = base + ".mp4"
+                            try:
+                                os.replace(dest, newdest)
+                                dest = newdest
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 return dest
         except Exception as exc:
             last_exc = exc
@@ -909,12 +1063,16 @@ Examples:
     p.add_argument("--retry-failed", action="store_true", help="Retry previously failed downloads")
     p.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to fetch")
     p.add_argument("--all", action="store_true", help="Fetch all posts by following pagination")
+    p.add_argument("--per-page", type=int, default=100, help="Number of posts to request per page when paginating (default: 100, max: 100 enforced by Reddit API)")
     p.add_argument("--force", action="store_true", help="Force re-download even if file exists")
+    p.add_argument("--sort", choices=["hot", "new", "top", "rising", "best"], default="new", help="Listing sort order to request from Reddit (default: new)")
     p.add_argument("--no-head-check", dest="head_check", action="store_false", help="Disable HEAD-based checks")
     p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N updates (default: 10)")
     p.add_argument("--partial-fingerprint", action="store_true", help="Enable partial-range fingerprinting")
     p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument("--no-save-meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time)")
+    p.add_argument("--no-comments", action="store_true", help="Do not fetch comments; only fetch submissions (use /submitted/)")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
@@ -1022,7 +1180,7 @@ Examples:
                 except Exception:
                     pass
                 dest = download_url(url, outdir, token=token, user_agent=user_agent, target_path=target)
-                if dest.endswith(".failed"):
+                if dest.endswith('.failed'):
                     logging.getLogger(__name__).warning("Still failed: %s | %s", host, os.path.basename(dest))
                     try:
                         logging.getLogger('reddit_file').warning(f"Still failed: {url} -> {dest}")
@@ -1046,14 +1204,17 @@ Examples:
 
     # Normalize and expand explicit flags into canonical reddit URLs
     urls_to_process = list(args.urls or [])
-    # --user values map to https://www.reddit.com/user/<user>/
+    # --user values map to https://www.reddit.com/user/<user>/ or /submitted/ when --no-comments is used
     if getattr(args, "user", None):
         for user_arg in args.user:
             # Support comma-separated values
             for u in user_arg.split(','):
                 if u.strip():
                     uname = u.strip().lstrip("/@ ")
-                    urls_to_process.append(f"https://www.reddit.com/user/{uname}/")
+                    if getattr(args, "no_comments", False):
+                        urls_to_process.append(f"https://www.reddit.com/user/{uname}/submitted/")
+                    else:
+                        urls_to_process.append(f"https://www.reddit.com/user/{uname}/")
     # --subreddit values map to https://www.reddit.com/r/<subreddit>/
     if getattr(args, "subreddit", None):
         for sub_arg in args.subreddit:
@@ -1074,11 +1235,25 @@ Examples:
                         pid_clean = pid_clean[3:]
                     urls_to_process.append(f"https://www.reddit.com/comments/{pid_clean}/")
 
+                # If user passed explicit profile URLs and requested no comments, convert to /submitted/
+                if getattr(args, "no_comments", False):
+                    new_urls = []
+                    for u in urls_to_process:
+                        try:
+                            if re.search(r"/user/[^/]+/($|$|$)", u):
+                                # convert trailing user URL to submitted
+                                new_urls.append(re.sub(r"(/user/[^/]+/)(?:$|$)", r"\1submitted/", u))
+                            else:
+                                new_urls.append(u)
+                        except Exception:
+                            new_urls.append(u)
+                    urls_to_process = new_urls
+
     for url in urls_to_process:
         # decide whether to paginate
         paginate = bool(args.all or args.max_posts)
         try:
-            posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=paginate, max_posts=args.max_posts, per_page=100)
+            posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=paginate, max_posts=args.max_posts, per_page=args.per_page, debug=getattr(args, 'debug', False), sort=getattr(args, 'sort', None))
             stats["pages_fetched"] += pages
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to fetch %s: %s", url, e)
@@ -1150,7 +1325,8 @@ Examples:
                 looks_like_submission = bool(media_urls)
 
             meta_path = None
-            if looks_like_submission:
+            # Respect --no-save-meta: avoid writing per-post metadata JSON when requested
+            if looks_like_submission and not getattr(args, "no_save_meta", False):
                 meta_path = os.path.join(source_dir, f"{_sanitize_filename(post_id)}.json")
                 try:
                     with open(meta_path, "w", encoding="utf-8") as fh:
@@ -1188,15 +1364,8 @@ Examples:
                         folder, post_id, u = item
                         meta_path = None
                     def _skipped_return(dest):
-                        # when a media is skipped because it already exists, delete the per-post JSON
-                        try:
-                            if meta_path and os.path.exists(meta_path):
-                                try:
-                                    os.remove(meta_path)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                        # when a media is skipped because it already exists, preserve the per-post JSON
+                        # (previous behavior removed metadata; keep it to avoid surprise data loss)
                         return folder, post_id, u, dest, True
                     nonlocal downloads_since_save
                     limiter.wait_for_token()
@@ -1543,12 +1712,30 @@ Examples:
         pass
     elapsed = time.time() - stats["start_time"]
     logger = logging.getLogger(__name__)
-    # format bytes with thousands separator via f-string to avoid logging format conflicts
+    # format bytes into human-readable units (KB/MB/GB)
+    def _human_bytes(n: int) -> str:
+        try:
+            if n is None:
+                return "0 B"
+            n = int(n)
+        except Exception:
+            return str(n)
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(n)
+        idx = 0
+        while size >= 1024 and idx < len(units) - 1:
+            size /= 1024.0
+            idx += 1
+        if idx == 0:
+            return f"{int(size)} {units[idx]}"
+        return f"{size:.1f} {units[idx]}"
+
+    bytes_h = _human_bytes(stats.get('bytes_downloaded', 0))
     summary = (
         f"Summary:\n  Pages fetched: {stats['pages_fetched']}\n  Posts processed: {stats['posts_processed']}\n"
         f"  Media attempted: {stats['media_attempted']}\n  Media downloaded: {stats['media_downloaded']}\n"
         f"  Media failed: {stats['media_failed']}\n  Media skipped: {stats.get('media_skipped', 0)}\n"
-        f"  Bytes downloaded: {stats['bytes_downloaded']:,}\n  Elapsed time: {elapsed:.1f}s"
+        f"  Bytes downloaded: {bytes_h}\n  Elapsed time: {elapsed:.1f}s"
     )
     logger.info(summary)
 
