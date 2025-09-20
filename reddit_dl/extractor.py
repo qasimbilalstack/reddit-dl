@@ -665,6 +665,12 @@ def get_source_name(url: str) -> str:
         p = urlparse(url)
         path = (p.path or "").strip("/")
         parts = [p for p in path.split("/") if p]
+        # If this is a permalink to a single post, use the post id folder
+        # e.g. /comments/<postid>/ or /r/<sub>/comments/<postid>/ -> post_<postid>
+        if len(parts) >= 2 and parts[0].lower() == "comments":
+            postid = parts[1]
+            return _sanitize_filename(f"post_{postid}")
+
         if len(parts) >= 2 and parts[0].lower() in ("r", "user", "u"):
             key = parts[0].lower()
             name = parts[1]
