@@ -1390,21 +1390,35 @@ def main(argv=None):
                     logging.getLogger(__name__).warning("Failed to write metadata for %s: %s", post_id, e)
 
             if media_urls:
-                # store mapping post_id -> (urls, meta_path) so we can delete meta on skip
-                post_urls_map[post_id] = (list(media_urls), meta_path)
+                # compute context label: when crawling a user feed, show subreddit;
+                # when crawling a subreddit feed, show author. Fallback to None.
+                context_label = None
+                try:
+                    if source_name.startswith("u_"):
+                        sub = pdata.get("subreddit")
+                        if sub:
+                            context_label = f"r_{sub}"
+                    elif source_name.startswith("r_"):
+                        auth = pdata.get("author")
+                        if auth:
+                            context_label = f"u_{auth}"
+                except Exception:
+                    context_label = None
+                # store mapping post_id -> (urls, meta_path, context_label) so we can delete meta on skip
+                post_urls_map[post_id] = (list(media_urls), meta_path, context_label)
 
         # Download media: either parallel across posts and within posts, or sequential per post
         if post_urls_map:
             # Flatten tasks (prefix each url with its target folder and post_id) and download in parallel
             tasks = []
-            for post_id, (urls, meta_path) in post_urls_map.items():
+            for post_id, (urls, meta_path, ctx_label) in post_urls_map.items():
                 for u in urls:
-                    # folder will be source_dir; include meta_path for possible deletion on skip
-                    tasks.append((source_dir, post_id, u, meta_path))
+                    # folder will be source_dir; include meta_path and context_label for logging
+                    tasks.append((source_dir, post_id, u, meta_path, ctx_label))
 
             # post_urls_map values are (urls, meta_path)
             # compute total_media by summing the length of each urls list
-            total_media = sum(len(urls) for (urls, _meta) in post_urls_map.values())
+            total_media = sum(len(urls) for (urls, _meta, _ctx) in post_urls_map.values())
             logging.getLogger(__name__).info("Downloading %d media files with concurrency=%s, rate=%s/s", total_media, concurrency, rate)
             stats["media_attempted"] += total_media
             # Compact pre-scan: check index and skip scheduling for known MD5s (best-effort, no file copies)
@@ -1413,13 +1427,18 @@ def main(argv=None):
                     remaining = []
                     for item in tasks:
                         try:
-                            folder, post_id, u, _meta = item
+                            folder, post_id, u, _meta, ctx_label = item
                         except Exception:
                             try:
-                                folder, post_id, u = item
+                                folder, post_id, u, _meta = item
+                                ctx_label = None
                             except Exception:
-                                remaining.append(item)
-                                continue
+                                try:
+                                    folder, post_id, u = item
+                                    ctx_label = None
+                                except Exception:
+                                    remaining.append(item)
+                                    continue
                         try:
                             norm_u = normalize_media_url(u)
                             existing_md5 = idx.get_md5_for_url(norm_u)
@@ -1435,16 +1454,20 @@ def main(argv=None):
                         except Exception:
                             pass
                         try:
-                            from urllib.parse import urlparse
-                            lh = (urlparse(u).hostname or "").lower()
-                            host_label = "Unknown"
-                            if "redgifs" in lh:
-                                host_label = "Redgifs"
-                            elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
-                                host_label = "Redd.it"
+                            # prefer explicit context label when provided
+                            if ctx_label:
+                                host_label = ctx_label
                             else:
-                                parts = lh.split('.') if lh else []
-                                host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
+                                from urllib.parse import urlparse
+                                lh = (urlparse(u).hostname or "").lower()
+                                host_label = "Unknown"
+                                if "redgifs" in lh:
+                                    host_label = "Redgifs"
+                                elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                                    host_label = "Redd.it"
+                                else:
+                                    parts = lh.split('.') if lh else []
+                                    host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
                         except Exception:
                             host_label = "Unknown"
                         try:
@@ -1453,7 +1476,7 @@ def main(argv=None):
                             path = urlparse(norm_u).path or ""
                             ext = os.path.splitext(unquote(path))[1] or ""
                             display_name = _sanitize_filename(post_id) + ext if post_id else os.path.basename(unquote(path) or norm_u)
-                            logging.getLogger(__name__).info("[%s] [%s] Skipped %s", post_id, host_label, display_name)
+                            logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, display_name)
                         except Exception:
                             pass
                     tasks = remaining
@@ -1464,17 +1487,22 @@ def main(argv=None):
             limiter = TokenBucket(rate=rate)
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                 def worker_item_with_rate(item):
-                    # item is (folder, post_id, url, meta_path)
+                    # item is (folder, post_id, url, meta_path, context_label)
                     try:
-                        folder, post_id, u, meta_path = item
+                        folder, post_id, u, meta_path, context_label = item
                     except Exception:
-                        # backward compatibility: fallback to older 3-tuple
-                        folder, post_id, u = item
-                        meta_path = None
+                        try:
+                            folder, post_id, u, meta_path = item
+                            context_label = None
+                        except Exception:
+                            # backward compatibility: fallback to older 3-tuple
+                            folder, post_id, u = item
+                            meta_path = None
+                            context_label = None
                     def _skipped_return(dest):
                         # when a media is skipped because it already exists, preserve the per-post JSON
                         # (previous behavior removed metadata; keep it to avoid surprise data loss)
-                        return folder, post_id, u, dest, True
+                        return folder, post_id, u, dest, True, context_label
                     nonlocal downloads_since_save
                     limiter.wait_for_token()
                     if args.force:
@@ -1489,7 +1517,7 @@ def main(argv=None):
                                     idx.add_path_for_md5(md5, dst)
                                 except Exception:
                                     pass
-                        return folder, post_id, u, dst, False
+                        return folder, post_id, u, dst, False, context_label
                     # quick URL-based skip: if we've seen this URL before and it maps to an md5,
                     # and the md5 already exists in our index, skip downloading
                     norm_u = normalize_media_url(u)
@@ -1636,7 +1664,7 @@ def main(argv=None):
                                                 idx.set_etag_md5(etag, md5)
                                             except Exception:
                                                 pass
-                                        return folder, post_id, u, p, True
+                                        return folder, post_id, u, p, True, context_label
                                 except Exception:
                                     continue
                         except Exception:
@@ -1733,14 +1761,49 @@ def main(argv=None):
                     if not dst.endswith('.failed'):
                         md5 = compute_md5(dst)
                         if md5 and idx:
+                            # Post-download dedupe: if this md5 already exists in the index
+                            # and points to an existing file, delete the newly-downloaded
+                            # file and treat it as skipped to avoid duplicate storage.
                             try:
-                                idx.set_url_md5(norm_u, md5)
+                                existing_paths = idx.get_paths_for_md5(md5)
                             except Exception:
-                                pass
-                            try:
-                                idx.add_path_for_md5(md5, dst)
-                            except Exception:
-                                pass
+                                existing_paths = []
+                            existing_found = None
+                            for p in existing_paths:
+                                try:
+                                    if os.path.exists(p):
+                                        existing_found = p
+                                        break
+                                except Exception:
+                                    continue
+                            if existing_found and existing_found != dst:
+                                # remove the newly downloaded duplicate file
+                                try:
+                                    os.remove(dst)
+                                except Exception:
+                                    pass
+                                try:
+                                    stats["media_skipped"] += 1
+                                except Exception:
+                                    pass
+                                try:
+                                    logging.getLogger(__name__).info("[%s] Skipped %s (already downloaded)", post_id, os.path.basename(dst))
+                                except Exception:
+                                    pass
+                                # ensure the URL -> md5 mapping exists
+                                try:
+                                    idx.set_url_md5(norm_u, md5)
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    idx.set_url_md5(norm_u, md5)
+                                except Exception:
+                                    pass
+                                try:
+                                    idx.add_path_for_md5(md5, dst)
+                                except Exception:
+                                    pass
                             # capture ETag if present in last HEAD or response headers (best-effort)
                             try:
                                 _, resp_etag = head_check(u, user_agent)
@@ -1773,13 +1836,19 @@ def main(argv=None):
                                 except Exception:
                                     pass
                                 downloads_since_save = 0
-                    return folder, post_id, u, dst, False
+                    return folder, post_id, u, dst, False, context_label
 
                 futures = {ex.submit(worker_item_with_rate, item): item for item in tasks}
                 for fut in as_completed(futures):
                     item = futures[fut]
                     try:
-                        folder, post_id, url, dest, skipped = fut.result()
+                        # result format: folder, post_id, url, dest, skipped, context_label
+                        res = fut.result()
+                        if len(res) == 6:
+                            folder, post_id, url, dest, skipped, res_ctx = res
+                        else:
+                            folder, post_id, url, dest, skipped = res
+                            res_ctx = None
                     except Exception as e:
                         # item is (folder, post_id, url)
                         folder = item[0]
@@ -1797,29 +1866,33 @@ def main(argv=None):
                     try:
                         from urllib.parse import urlparse
 
-                        hostname = (urlparse(url).hostname or "") if url else ""
-                        lh = (hostname or "").lower()
-                        if "redgifs" in lh:
-                            host_label = "Redgifs"
-                        elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
-                            host_label = "Redd.it"
+                        # prefer the worker-provided context label when present
+                        if res_ctx:
+                            host_label = res_ctx
                         else:
-                            parts = lh.split(".") if lh else []
-                            if len(parts) >= 2:
-                                sld = parts[-2]
-                                tld = parts[-1]
-                                # show .it tld as Redd.it style, otherwise drop common tlds
-                                if tld == "it":
-                                    host_label = f"{sld.capitalize()}.{tld}"
-                                else:
-                                    host_label = sld.capitalize()
+                            hostname = (urlparse(url).hostname or "") if url else ""
+                            lh = (hostname or "").lower()
+                            if "redgifs" in lh:
+                                host_label = "Redgifs"
+                            elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                                host_label = "Redd.it"
                             else:
-                                host_label = (lh or "Unknown").capitalize()
+                                parts = lh.split(".") if lh else []
+                                if len(parts) >= 2:
+                                    sld = parts[-2]
+                                    tld = parts[-1]
+                                    # show .it tld as Redd.it style, otherwise drop common tlds
+                                    if tld == "it":
+                                        host_label = f"{sld.capitalize()}.{tld}"
+                                    else:
+                                        host_label = sld.capitalize()
+                                else:
+                                    host_label = (lh or "Unknown").capitalize()
                     except Exception:
                         host_label = "Unknown"
 
                     if skipped:
-                        logging.getLogger(__name__).info("[%s] [%s] Skipped %s", post_id, host_label, os.path.basename(dest))
+                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
                         # verbose file log with full URL -> dest
                         try:
                             logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Skipped already downloaded : {url} -> {dest}")
@@ -1827,14 +1900,14 @@ def main(argv=None):
                             pass
                         stats["media_skipped"] += 1
                     elif dest.endswith(".failed"):
-                        logging.getLogger(__name__).warning("[%s] [%s] Failed %s", post_id, host_label, os.path.basename(dest))
+                        logging.getLogger(__name__).warning("❌ Failed [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
                         try:
                             logging.getLogger('reddit_file').warning(f"[{post_id}] [{host_label}] Failed to download : {url} -> {dest}")
                         except Exception:
                             pass
                         stats["media_failed"] += 1
                     else:
-                        logging.getLogger(__name__).info("[%s] [%s] Downloaded %s", post_id, host_label, os.path.basename(dest))
+                        logging.getLogger(__name__).info("✅ Downloaded [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
                         try:
                             logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Downloaded from {url} -> {dest}")
                         except Exception:
@@ -1845,8 +1918,8 @@ def main(argv=None):
                         except Exception:
                             pass
 
-        # update all_media set with each URL (post_urls_map items are post_id -> (urls, meta_path))
-        for (pid, (urls, _meta)) in post_urls_map.items():
+        # update all_media set with each URL (post_urls_map items are post_id -> (urls, meta_path, ctx_label))
+        for (pid, (urls, _meta, _ctx)) in post_urls_map.items():
             for u in urls:
                 all_media.add(u)
 
