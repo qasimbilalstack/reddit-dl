@@ -1407,6 +1407,59 @@ def main(argv=None):
             total_media = sum(len(urls) for (urls, _meta) in post_urls_map.values())
             logging.getLogger(__name__).info("Downloading %d media files with concurrency=%s, rate=%s/s", total_media, concurrency, rate)
             stats["media_attempted"] += total_media
+            # Compact pre-scan: check index and skip scheduling for known MD5s (best-effort, no file copies)
+            try:
+                if idx and tasks:
+                    remaining = []
+                    for item in tasks:
+                        try:
+                            folder, post_id, u, _meta = item
+                        except Exception:
+                            try:
+                                folder, post_id, u = item
+                            except Exception:
+                                remaining.append(item)
+                                continue
+                        try:
+                            norm_u = normalize_media_url(u)
+                            existing_md5 = idx.get_md5_for_url(norm_u)
+                        except Exception:
+                            remaining.append(item)
+                            continue
+                        if not existing_md5:
+                            remaining.append(item)
+                            continue
+                        # mark skipped immediately and log (no network/file ops)
+                        try:
+                            stats["media_skipped"] += 1
+                        except Exception:
+                            pass
+                        try:
+                            from urllib.parse import urlparse
+                            lh = (urlparse(u).hostname or "").lower()
+                            host_label = "Unknown"
+                            if "redgifs" in lh:
+                                host_label = "Redgifs"
+                            elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                                host_label = "Redd.it"
+                            else:
+                                parts = lh.split('.') if lh else []
+                                host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
+                        except Exception:
+                            host_label = "Unknown"
+                        try:
+                            # prefer showing the per-post filename (post_id + extension) so logs match downloads
+                            from urllib.parse import urlparse, unquote
+                            path = urlparse(norm_u).path or ""
+                            ext = os.path.splitext(unquote(path))[1] or ""
+                            display_name = _sanitize_filename(post_id) + ext if post_id else os.path.basename(unquote(path) or norm_u)
+                            logging.getLogger(__name__).info("[%s] [%s] Skipped %s", post_id, host_label, display_name)
+                        except Exception:
+                            pass
+                    tasks = remaining
+            except Exception:
+                pass
+
             # use thread pool but respect global rate limiter by each worker calling limiter
             limiter = TokenBucket(rate=rate)
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
@@ -1615,7 +1668,35 @@ def main(argv=None):
                                 remote_fp = None
                             if remote_fp:
                                 try:
-                                    # lazily compute partial fingerprints for existing md5 files
+                                    # first, check persistent fp->md5 mapping (fast)
+                                    mapped_md5 = None
+                                    try:
+                                        mapped_md5 = idx.get_md5_for_fp(remote_fp) if idx else None
+                                    except Exception:
+                                        mapped_md5 = None
+                                    if mapped_md5:
+                                        # found mapping; try to find a path for this md5
+                                        candidate_paths = []
+                                        try:
+                                            candidate_paths = idx.get_paths_for_md5(mapped_md5) if idx else []
+                                        except Exception:
+                                            candidate_paths = []
+                                        found = None
+                                        for p in candidate_paths:
+                                            try:
+                                                if os.path.exists(p):
+                                                    found = p
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if found:
+                                            try:
+                                                idx.set_url_md5(norm_u, mapped_md5)
+                                            except Exception:
+                                                pass
+                                            return _skipped_return(found)
+
+                                    # fallback: lazily compute partial fingerprints for existing md5 files
                                     for md5, p in idx.iter_md5_paths():
                                         if md5 in _partial_cache:
                                             local_fp = _partial_cache[md5]
@@ -1634,6 +1715,11 @@ def main(argv=None):
                                             # match found
                                             try:
                                                 idx.set_url_md5(norm_u, md5)
+                                            except Exception:
+                                                pass
+                                            # persist mapping fp -> md5 for faster future lookups
+                                            try:
+                                                idx.set_fp_md5(remote_fp, md5)
                                             except Exception:
                                                 pass
                                             return _skipped_return(p)
@@ -1663,6 +1749,20 @@ def main(argv=None):
                                         idx.set_etag_md5(resp_etag, md5)
                                     except Exception:
                                         pass
+                            except Exception:
+                                pass
+                            # persist partial fingerprint for this md5 to speed future runs
+                            try:
+                                if partial_enabled:
+                                    from hashlib import sha256
+                                    with open(dst, 'rb') as _fh:
+                                        data = _fh.read(partial_size)
+                                        if data:
+                                            fp = sha256(data).hexdigest()
+                                            try:
+                                                idx.set_fp_md5(fp, md5)
+                                            except Exception:
+                                                pass
                             except Exception:
                                 pass
                             # periodic checkpoint (optional)

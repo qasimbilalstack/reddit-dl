@@ -62,6 +62,14 @@ class Md5Index:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fp_to_md5 (
+                    fp TEXT PRIMARY KEY,
+                    md5 TEXT
+                )
+                """
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -128,6 +136,21 @@ class Md5Index:
             rows = []
         for md5, path in rows:
             yield md5, path
+
+    # partial-fingerprint mappings (fp -> md5)
+    def get_md5_for_fp(self, fp: str) -> Optional[str]:
+        with self._lock:
+            cur = self._conn.execute("SELECT md5 FROM fp_to_md5 WHERE fp = ?", (fp,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_fp_md5(self, fp: str, md5: str) -> None:
+        with self._lock:
+            try:
+                self._conn.execute("INSERT OR REPLACE INTO fp_to_md5(fp, md5) VALUES(?, ?)", (fp, md5))
+                self._conn.commit()
+            except Exception:
+                pass
 
     def has_any_entries(self) -> bool:
         with self._lock:
