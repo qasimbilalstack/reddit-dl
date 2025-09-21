@@ -1127,9 +1127,28 @@ def main(argv=None):
     # Note: legacy JSON->SQLite migration removed. If you need to import an old
     # `.md5_index.json` file, run a one-time migration tool separately.
 
-    # control periodic persistence (sqlite commits are immediate; save_interval kept for compatibility)
+    # control periodic persistence (sqlite commits are immediate).
+    # Preferred config key: `md5_save_interval` (int, how many downloads between MD5/index checkpoints)
+    # Backward-compatible keys: `save_interval` in config or `REDDIT_DL_SAVE_INTERVAL` env var
     downloads_since_save = 0
-    save_interval = int(args.save_interval or 10)
+    # precedence: CLI arg -> env (new) -> env (legacy) -> config (new) -> config (legacy) -> default
+    def _parse_positive_int(val, default: int):
+        try:
+            if val is None:
+                return default
+            v = int(val)
+            if v <= 0:
+                return default
+            return v
+        except Exception:
+            return default
+
+    env_md5 = os.environ.get("REDDIT_DL_MD5_SAVE_INTERVAL")
+    env_legacy = os.environ.get("REDDIT_DL_SAVE_INTERVAL")
+    cfg_reddit = cfg.get("extractor", {}).get("reddit", {})
+    cfg_md5 = cfg_reddit.get("md5_save_interval")
+    cfg_legacy = cfg_reddit.get("save_interval")
+    save_interval = _parse_positive_int(getattr(args, "save_interval", None) or env_md5 or env_legacy or cfg_md5 or cfg_legacy, 10)
     partial_enabled = bool(args.partial_fingerprint)
     partial_size = int(args.partial_size or 65536)
     # cache for partial fingerprints of local files for this run: md5 -> fingerprint
@@ -1205,8 +1224,21 @@ def main(argv=None):
                         pass
 
     # concurrency/rate can be set in config or via env vars
-    concurrency = int(os.environ.get("REDDIT_DL_CONCURRENCY") or reddit_cfg.get("concurrency") or 4)
-    rate = float(os.environ.get("REDDIT_DL_RATE") or reddit_cfg.get("rate") or 4.0)
+    # Friendly config keys supported: parallel_downloads (alias for concurrency)
+    # and requests_per_second (alias for rate). Environment variables still
+    # use REDDIT_DL_CONCURRENCY and REDDIT_DL_RATE for backward compatibility.
+    concurrency = int(
+        os.environ.get("REDDIT_DL_CONCURRENCY")
+        or reddit_cfg.get("parallel_downloads")
+        or reddit_cfg.get("concurrency")
+        or 4
+    )
+    rate = float(
+        os.environ.get("REDDIT_DL_RATE")
+        or reddit_cfg.get("requests_per_second")
+        or reddit_cfg.get("rate")
+        or 4.0
+    )
 
     # Normalize and expand explicit flags into canonical reddit URLs
     urls_to_process = list(args.urls or [])

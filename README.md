@@ -4,15 +4,17 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://python.org)
 [![Version](https://img.shields.io/badge/version-0.1-green.svg)](setup.py)
 
-A focused Reddit media extractor and downloader built as a streamlined gallery-dl fork. Features OAuth2 authentication, intelligent deduplication, and comprehensive media extraction from Reddit users, subreddits, and individual posts.
+ focused fork of gallery-dl — that uses OAuth2 for secure API access, smart SQLite-backed deduplication to avoid re-downloading, and robust extraction across users, subreddits, and individual posts. It’s built for speed (concurrent workers + polite rate-limiting) and bandwidth efficiency (HEAD/ETag and partial-range checks), while keeping logs and output organized so your downloads stay easy to manage.
 
 ## Table of Contents
 
+- [Features](#features)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
-- [Configuration](#configuration)
+- [Configuration](#configuration) 
 - [CLI Reference](#cli-reference)
 - [Examples](#examples)
+- [Output Structure](#output-structure)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [License](#license)
@@ -25,6 +27,7 @@ A focused Reddit media extractor and downloader built as a streamlined gallery-d
 - **Gallery Support** - Automatic expansion and host-specific URL normalization
 - **Flexible Output** - Organized downloads with customizable directory structure
 - **Comprehensive Logging** - Detailed audit trails for all download activities
+- **High performance - Parallel, rate-limited downloads for maximum speed without hammering servers.
 
 ## Installation
 
@@ -101,21 +104,6 @@ cp config.example.json config.json
 
 Edit `config.json` with your Reddit app credentials:
 
-```json
-{
-  "extractor": {
-    "reddit": {
-      "oauth": {
-        "client_id": "YOUR_CLIENT_ID",
-        "client_secret": "YOUR_CLIENT_SECRET",
-        "username": "YOUR_REDDIT_USERNAME",
-        "password": "YOUR_REDDIT_PASSWORD"
-      }
-    }
-  }
-}
-```
-
 ### 3. Start Downloading
 
 Download media from a Reddit user:
@@ -127,28 +115,7 @@ reddit-dl --config config.json "https://www.reddit.com/user/SomeUser/"
 Files will be saved to `downloads/` with organized subfolders and detailed logs in `downloads/logs.txt`.
 
 
-### Advanced Configuration Options
-
-```json
-{
-  "extractor": {
-    "reddit": {
-      "oauth": {
-        "client_id": "YOUR_CLIENT_ID",
-        "client_secret": "YOUR_CLIENT_SECRET",
-        "username": "YOUR_REDDIT_USERNAME", 
-        "password": "YOUR_REDDIT_PASSWORD"
-      },
-      "user_agent": "reddit-dl/0.1 by YOUR_USERNAME",
-      "output_dir": "downloads",
-      "max_posts": 100,
-      "save_interval": 10
-    }
-  }
-}
-```
-
-### Configuration Parameters
+## Configuration
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -158,8 +125,43 @@ Files will be saved to `downloads/` with organized subfolders and detailed logs 
 | `password` | Reddit password | Required |
 | `user_agent` | Custom user agent string | `reddit-dl/0.1` |
 | `output_dir` | Download directory | `downloads` |
+| `token_cache` | Path to OAuth token cache file | `~/.reddit_dl_tokens.json` |
 | `max_posts` | Default maximum posts per source | Unlimited |
-| `save_interval` | MD5 database save frequency | 10 |
+| `default_max_posts` | Default max posts when no --max-posts or --all | 1000 |
+| `md5_save_interval` | MD5/index checkpoint frequency (downloads between saves) | 10 |
+| `parallel_downloads` | Number of parallel downloads | 4 |
+| `requests_per_second` | Rate limit for download requests (per second) | 4.0 |
+
+Recommended conservative presets (choose one based on your environment):
+
+- Gentle (very low load): `parallel_downloads: 1`, `requests_per_second: 1.0`
+- Conservative (recommended): `parallel_downloads: 2`, `requests_per_second: 1.0`
+- Balanced (default): `parallel_downloads: 4`, `requests_per_second: 4.0`
+
+Configuration example all available options:
+
+```json
+{
+  "extractor": {
+    "reddit": {
+      "oauth": {
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "username": "YOUR_REDDIT_USERNAME",
+        "password": "YOUR_REDDIT_PASSWORD"
+      },
+      "user_agent": "reddit-dl/0.1 by YOUR_USERNAME",
+  "output_dir": "downloads",
+  "md5_save_interval": 10,
+      "token_cache": "~/.reddit_dl_tokens.json",
+      "default_max_posts": 1000,
+      "parallel_downloads": 2,
+      "requests_per_second": 1.0
+    }
+  }
+}
+```
+```
 
 ### Security Considerations
 

@@ -9,10 +9,11 @@
       },
       "user_agent": "reddit-dl/0.1 by YOUR_USERNAME",
       "output_dir": "downloads",
-      "token_cache": "~/.reddit_dl_tokens.json",
-      "default_max_posts": 1000,
-      "concurrency": 4,
-      "rate": 4.0
+  "token_cache": "~/.reddit_dl_tokens.json",
+  "default_max_posts": 1000,
+  "md5_save_interval": 10,
+      "parallel_downloads": 4,
+      "requests_per_second": 4.0
     }
   }
 }
