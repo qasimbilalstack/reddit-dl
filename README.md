@@ -161,14 +161,6 @@ Configuration example all available options:
   }
 }
 ```
-```
-
-### Security Considerations
-
-- Store configuration files securely and never commit credentials to version control
-- Consider using environment variables for sensitive data in production
-- Regularly rotate Reddit application credentials
-- Follow your organization's security policies for credential management
 
 ## CLI Reference
 
