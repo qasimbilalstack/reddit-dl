@@ -58,11 +58,16 @@ class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
 # Disk-backed token cache helpers
 def _default_token_cache_path() -> str:
     # allow override via env var
-    return os.environ.get("REDDIT_TOKEN_CACHE") or os.path.expanduser("~/.reddit_dl_tokens.json")
+    # default token cache path in the user's home
+    return os.path.expanduser("~/.reddit_dl_tokens.json")
 
 
 def _load_token_cache_file(path: Optional[str] = None) -> Dict[str, Dict]:
     path = path or _default_token_cache_path()
+    try:
+        path = os.path.expanduser(path)
+    except Exception:
+        pass
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
@@ -74,6 +79,10 @@ def _load_token_cache_file(path: Optional[str] = None) -> Dict[str, Dict]:
 
 def _save_token_cache_file(cache: Dict[str, Dict], path: Optional[str] = None) -> None:
     path = path or _default_token_cache_path()
+    try:
+        path = os.path.expanduser(path)
+    except Exception:
+        pass
     try:
         d = os.path.dirname(path)
         if d and not os.path.exists(d):
@@ -347,12 +356,23 @@ def get_oauth_token(cfg: Dict) -> Optional[str]:
     """
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
     oauth = reddit_cfg.get("oauth") or {}
-    # allow environment variable overrides for secrets (safer than committing to config)
-    client_id = os.environ.get("REDDIT_CLIENT_ID") or oauth.get("client_id")
-    client_secret = os.environ.get("REDDIT_CLIENT_SECRET") or oauth.get("client_secret")
-    username = os.environ.get("REDDIT_USERNAME") or oauth.get("username")
-    password = os.environ.get("REDDIT_PASSWORD") or oauth.get("password")
-    user_agent = os.environ.get("REDDIT_USER_AGENT") or reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
+    # Use only values provided in the config file (no environment overrides).
+    client_id = oauth.get("client_id")
+    client_secret = oauth.get("client_secret")
+    # ignore obvious placeholders like YOUR_CLIENT_ID
+    try:
+        if isinstance(client_id, str) and client_id.strip().lower().startswith("your"):
+            client_id = None
+    except Exception:
+        pass
+    try:
+        if isinstance(client_secret, str) and client_secret.strip().lower().startswith("your"):
+            client_secret = None
+    except Exception:
+        pass
+    username = oauth.get("username")
+    password = oauth.get("password")
+    user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
 
     if not (client_id and client_secret):
         return None
@@ -366,8 +386,8 @@ def get_oauth_token(cfg: Dict) -> Optional[str]:
         if time.time() < expires_at - 10:
             return token
 
-    # Next, try disk-backed cache
-    token_cache_path = os.environ.get("REDDIT_TOKEN_CACHE") or reddit_cfg.get("token_cache")
+    # Next, try disk-backed cache (prefer config token_cache, fallback to default)
+    token_cache_path = reddit_cfg.get("token_cache") or _default_token_cache_path()
     disk_cache = _load_token_cache_file(token_cache_path)
     entry = disk_cache.get(client_id)
     if isinstance(entry, dict):
@@ -1076,6 +1096,81 @@ def main(argv=None):
     p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
+    # If user didn't provide a --config and no env credentials are present,
+    # create a sample config in the user's home directory and instruct them
+    # to populate the oauth client_id/client_secret (and optional username/password).
+    try:
+        if not getattr(args, "config", None):
+            # Search for config in multiple conventional locations in this order:
+            # 1) ./config.json (cwd)
+            # 2) ~/config.json
+            local_cfg_path = os.path.join(os.getcwd(), "config.json")
+            home_cfg_path = os.path.expanduser("~/config.json")
+
+            found = None
+            for p in (local_cfg_path, home_cfg_path):
+                try:
+                    if p and os.path.exists(p):
+                        found = p
+                        break
+                except Exception:
+                    continue
+
+            if found:
+                try:
+                    cfg = load_config(found)
+                except Exception:
+                    cfg = {}
+            else:
+                # prefer explicit env overrides first
+                env_client = os.environ.get("REDDIT_CLIENT_ID")
+                env_secret = os.environ.get("REDDIT_CLIENT_SECRET")
+                if not env_client or not env_secret:
+                    sample_path = os.path.expanduser("~/config.json")
+                    # do not overwrite an existing file
+                    if not os.path.exists(sample_path):
+                        sample_cfg = {
+                            "extractor": {
+                                "reddit": {
+                                    "oauth": {
+                                        "client_id": "",
+                                        "client_secret": "",
+                                        "# optional_username": "YOUR_REDDIT_USERNAME",
+                                        "# optional_password": "YOUR_REDDIT_PASSWORD"
+                                    },
+                                    "user_agent": "reddit-dl/0.1 by YOUR_USERNAME",
+                                    "output_dir": "downloads",
+                                    "token_cache": "~/reddit_dl_tokens.json",
+                                    "default_max_posts": 500,
+                                    "md5_save_interval": 10,
+                                    "parallel_downloads": 4,
+                                    "requests_per_second": 4.0
+                                }
+                            }
+                        }
+                        try:
+                            with open(sample_path, "w", encoding="utf-8") as fh:
+                                json.dump(sample_cfg, fh, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+                    # Inform the user and exit so they can populate credentials
+                    msg = (
+                        "No --config provided and REDDIT_CLIENT_ID/SECRET not set.\n"
+                        f"A sample config was written to: {sample_path}\n"
+                        "Please add 'client_id' and 'client_secret' (and optional 'username'/'password') to this file before running the extractor.\n"
+                    )
+                    try:
+                        # Ensure the message is visible even before logging is configured
+                        print(msg, file=sys.stderr)
+                    except Exception:
+                        try:
+                            sys.stderr.write(msg + "\n")
+                        except Exception:
+                            pass
+                    # exit to avoid attempting OAuth with incomplete credentials
+                    sys.exit(1)
+    except Exception:
+        pass
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
     user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
     outdir = reddit_cfg.get("output_dir", "downloads")
@@ -1087,6 +1182,9 @@ def main(argv=None):
         default_max_posts = 500
 
     all_media = set()
+    # track unique subreddits and authors encountered during this run
+    processed_subreddits: Set[str] = set()
+    processed_authors: Set[str] = set()
     # configure logging
     log_level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
     # Omit the logger name to keep logs compact (no __main__ prefix)
@@ -1361,6 +1459,24 @@ def main(argv=None):
             if not post_id:
                 # skip anomalous entries
                 continue
+
+            # collect subreddit and author for reporting
+            try:
+                sub = pdata.get("subreddit")
+                # defensive: avoid storing author-like values in subreddit list
+                if sub:
+                    s_norm = str(sub).strip()
+                    s_low = s_norm.lower()
+                    if not (s_low.startswith("u_")):
+                        processed_subreddits.add(s_norm)
+            except Exception:
+                pass
+            try:
+                auth = pdata.get("author")
+                if auth:
+                    processed_authors.add(auth)
+            except Exception:
+                pass
 
             # collect media for this post
             media_urls = collect_media_from_post(child)
@@ -1765,17 +1881,10 @@ def main(argv=None):
                             # and points to an existing file, delete the newly-downloaded
                             # file and treat it as skipped to avoid duplicate storage.
                             try:
-                                existing_paths = idx.get_paths_for_md5(md5)
+                                # Use helper to find an existing file for this md5 and prune stale DB paths
+                                existing_found = idx.get_existing_path_for_md5(md5) if idx else None
                             except Exception:
-                                existing_paths = []
-                            existing_found = None
-                            for p in existing_paths:
-                                try:
-                                    if os.path.exists(p):
-                                        existing_found = p
-                                        break
-                                except Exception:
-                                    continue
+                                existing_found = None
                             if existing_found and existing_found != dst:
                                 # remove the newly downloaded duplicate file
                                 try:
@@ -1786,8 +1895,34 @@ def main(argv=None):
                                     stats["media_skipped"] += 1
                                 except Exception:
                                     pass
+                                # Pretty host label for logs (try to reuse context_label if available)
                                 try:
-                                    logging.getLogger(__name__).info("[%s] Skipped %s (already downloaded)", post_id, os.path.basename(dst))
+                                    if context_label:
+                                        host_label = context_label
+                                    else:
+                                        from urllib.parse import urlparse
+                                        lh = (urlparse(u).hostname or "").lower()
+                                        if "redgifs" in lh:
+                                            host_label = "Redgifs"
+                                        elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                                            host_label = "Redd.it"
+                                        else:
+                                            parts = lh.split('.') if lh else []
+                                            host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
+                                except Exception:
+                                    host_label = "Unknown"
+                                # compute md5 for the deleted file if possible (may be missing since file removed)
+                                md5_val = None
+                                try:
+                                    # prefer computing from existing index entry
+                                    md5_val = existing_found and compute_md5(existing_found)
+                                except Exception:
+                                    md5_val = None
+                                try:
+                                    if getattr(args, 'debug', False):
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dst), md5_val)
+                                    else:
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, os.path.basename(dst))
                                 except Exception:
                                     pass
                                 # ensure the URL -> md5 mapping exists
@@ -1892,10 +2027,20 @@ def main(argv=None):
                         host_label = "Unknown"
 
                     if skipped:
-                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
-                        # verbose file log with full URL -> dest
+                        # compute md5 if dest is a file (safe)
+                        md5_val = None
                         try:
-                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Skipped already downloaded : {url} -> {dest}")
+                            if os.path.isfile(dest):
+                                md5_val = compute_md5(dest)
+                        except Exception:
+                            md5_val = None
+                        if getattr(args, 'debug', False):
+                            logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dest), md5_val)
+                        else:
+                            logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
+                        # verbose file log with full URL -> dest and md5
+                        try:
+                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Skipped already downloaded : {url} -> {dest} md5={md5_val}")
                         except Exception:
                             pass
                         stats["media_skipped"] += 1
@@ -1907,9 +2052,19 @@ def main(argv=None):
                             pass
                         stats["media_failed"] += 1
                     else:
-                        logging.getLogger(__name__).info("✅ Downloaded [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
+                        # compute md5 for the downloaded file and include in logs
+                        md5_val = None
                         try:
-                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Downloaded from {url} -> {dest}")
+                            if os.path.isfile(dest):
+                                md5_val = compute_md5(dest)
+                        except Exception:
+                            md5_val = None
+                        if getattr(args, 'debug', False):
+                            logging.getLogger(__name__).info("✅ Downloaded [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dest), md5_val)
+                        else:
+                            logging.getLogger(__name__).info("✅ Downloaded [%s] [%s] %s", post_id, host_label, os.path.basename(dest))
+                        try:
+                            logging.getLogger('reddit_file').info(f"[{post_id}] [{host_label}] Downloaded from {url} -> {dest} md5={md5_val}")
                         except Exception:
                             pass
                         stats["media_downloaded"] += 1
@@ -1925,6 +2080,50 @@ def main(argv=None):
 
     if not all_media:
         logging.getLogger(__name__).info("No media downloaded.")
+    # Persist lists of processed subreddits and authors for auditing
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        subs_path = os.path.join(outdir, "processed_subreddits.txt")
+        auths_path = os.path.join(outdir, "processed_authors.txt")
+
+        # Helper to read existing lines into a set
+        def _read_existing_set(path):
+            s = set()
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        val = line.strip()
+                        if val:
+                            s.add(val)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                # ignore read errors and treat as empty
+                pass
+            return s
+
+        # Append only new, unique entries to each file so we don't overwrite history
+        try:
+            existing_subs = _read_existing_set(subs_path)
+            new_subs = sorted(x for x in processed_subreddits if x not in existing_subs)
+            if new_subs:
+                with open(subs_path, "a", encoding="utf-8") as fh:
+                    for s in new_subs:
+                        fh.write(f"{s}\n")
+        except Exception:
+            pass
+
+        try:
+            existing_auths = _read_existing_set(auths_path)
+            new_auths = sorted(x for x in processed_authors if x not in existing_auths)
+            if new_auths:
+                with open(auths_path, "a", encoding="utf-8") as fh:
+                    for a in new_auths:
+                        fh.write(f"{a}\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
     # checkpoint and close sqlite-backed md5 index if present
     try:
         if idx:

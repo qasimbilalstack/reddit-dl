@@ -137,6 +137,43 @@ class Md5Index:
         for md5, path in rows:
             yield md5, path
 
+    def get_existing_path_for_md5(self, md5: str) -> Optional[str]:
+        """Return a single existing filesystem path for the given md5, or None.
+
+        As a side-effect, prune any DB rows that reference files which no longer exist.
+        """
+        existing = None
+        try:
+            with self._lock:
+                cur = self._conn.execute("SELECT path FROM md5_to_paths WHERE md5 = ?", (md5,))
+                rows = [r[0] for r in cur.fetchall()]
+                # check which paths exist
+                to_delete = []
+                for p in rows:
+                    try:
+                        if os.path.exists(p):
+                            if not existing:
+                                existing = p
+                        else:
+                            to_delete.append(p)
+                    except Exception:
+                        # ignore path check errors
+                        continue
+                # prune missing paths
+                for p in to_delete:
+                    try:
+                        self._conn.execute("DELETE FROM md5_to_paths WHERE md5 = ? AND path = ?", (md5, p))
+                    except Exception:
+                        pass
+                if to_delete:
+                    try:
+                        self._conn.commit()
+                    except Exception:
+                        pass
+        except Exception:
+            return existing
+        return existing
+
     # partial-fingerprint mappings (fp -> md5)
     def get_md5_for_fp(self, fp: str) -> Optional[str]:
         with self._lock:
