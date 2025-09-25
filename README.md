@@ -197,6 +197,7 @@ Supported URL formats:
 | `-u, --user USER` | Reddit username(s) to fetch (comma-separated or repeat flag) |
 | `-r, --subreddit SUBREDDIT` | Subreddit name(s) to fetch (comma-separated or repeat flag) |
 | `-p, --postid POSTID` | Post ID(s) to fetch (comma-separated or repeat flag) |
+
 #### Download Control
 
 | Option | Description |
@@ -221,8 +222,16 @@ Supported URL formats:
 
 | Option | Description |
 |--------|-------------|
-| `--no-save-meta` | Do not write per-post metadata JSON files (saves disk and time) |
+| `--no-save-meta`, `--no-json-meta` | Do not write per-post metadata JSON files (saves disk and time) |
+| `--save-meta-only` | Only save per-post metadata JSON files; do not download media files |
 | `--comments` | Fetch comments in addition to submissions (disabled by default). Without this flag only submissions are fetched (uses /submitted/ URLs) |
+
+#### User Profile Options
+
+| Option | Description |
+|--------|-------------|
+| `--save-bio` | Fetch user profile bio(s) and save compact JSON into `<outdir>/user_bio` (for --user) |
+| `--only-verified` | When specified with --user or --subreddit, only process users/posts whose profile has `verified: true` |
 
 ## Examples
 
