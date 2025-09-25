@@ -4,3 +4,7 @@ __pycache__/
 config.json
 downloads/
 reddit_dl_tokens.json
+reddit_dl.egg-info/
+build/
+dist/
+settings.json

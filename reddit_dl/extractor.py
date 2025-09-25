@@ -22,6 +22,9 @@ import shutil
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import subprocess
+from reddit_dl.user_profile import fetch_user_profile
+from types import ModuleType
 
 REDDIT_OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 DEFAULT_USER_AGENT = "reddit-dl/0.1 (by /u/yourusername)"
@@ -1092,8 +1095,11 @@ def main(argv=None):
     p.add_argument("--partial-fingerprint", action="store_true", help="Enable partial-range fingerprinting")
     p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    p.add_argument("--no-save-meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time)")
+    p.add_argument("--no-save-meta", "--no-json-meta", dest="no_save_meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time). Alias: --no-json-meta")
+    p.add_argument("--save-meta-only", dest="save_meta_only", action="store_true", help="Only save per-post metadata JSON files; do not download media files.")
     p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
+    p.add_argument("--save-bio", dest="save_bio", action="store_true", help="Fetch user profile bio(s) and save compact JSON into <outdir>/user_bio (for --user)")
+    p.add_argument("--only-verified", dest="only_verified", action="store_true", help="When specified with --user, only process users whose profile has `verified: true`")
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     # If user didn't provide a --config and no env credentials are present,
@@ -1175,6 +1181,394 @@ def main(argv=None):
     user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
     outdir = reddit_cfg.get("output_dir", "downloads")
     token = get_oauth_token(cfg)
+
+    # Helper to print formatted console messages before logging is configured
+    def _early_console_log(level: str, fmt: str, *args):
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            lvl = level.upper().ljust(7)
+            try:
+                msg = fmt % args if args else fmt
+            except Exception:
+                # fallback to simple concatenation
+                try:
+                    msg = fmt.format(*args)
+                except Exception:
+                    msg = fmt
+            print(f"{ts} {lvl}: {msg}")
+        except Exception:
+            try:
+                print(fmt % args if args else fmt)
+            except Exception:
+                try:
+                    print(fmt)
+                except Exception:
+                    pass
+
+    # Shared set of users we've already emitted a 'Checked' status for in this run
+    checked_users: Set[str] = set()
+
+    def _check_user_verified(username: str, outdir: str, token: str, user_agent: str, 
+                           checked_users: Set[str], early_log_func, logger_func=None,
+                           skip_network: bool = False) -> tuple[bool, dict]:
+        """
+        Centralized user verification checker that consults caches first, then network.
+        
+        Returns: (is_verified: bool, profile_data: dict or None)
+        """
+        try:
+            # 1. Check verified_authors.txt cache first
+            verified_cache_path = os.path.join(outdir, "verified_authors.txt")
+            if os.path.exists(verified_cache_path):
+                try:
+                    with open(verified_cache_path, "r", encoding="utf-8") as vfh:
+                        for ln in vfh:
+                            if ln.strip() == username:
+                                if username not in checked_users:
+                                    early_log_func("INFO", "✓ %s (cached)", username)
+                                    if logger_func:
+                                        logger_func("✓ %s (cached)", username)
+                                    checked_users.add(username)
+                                return True, None
+                except Exception:
+                    pass
+            
+            # 2. Check local bio file if exists
+            bio_path = os.path.join(outdir, "user_bio", f"{_sanitize_filename(username)}.json")
+            if os.path.exists(bio_path):
+                try:
+                    with open(bio_path, "r", encoding="utf-8") as fh:
+                        bioj = json.load(fh)
+                    # support both compact and raw oauth shapes
+                    verified = None
+                    if isinstance(bioj, dict):
+                        if "verified" in bioj:
+                            verified = bool(bioj.get("verified"))
+                        else:
+                            verified = bool(bioj.get("data", {}).get("verified"))
+                    if verified is not None:
+                        if verified and username not in checked_users:
+                            early_log_func("INFO", "✓ %s", username)
+                            if logger_func:
+                                logger_func("✓ %s", username)
+                            checked_users.add(username)
+                            # append to verified cache if verified
+                            try:
+                                existing = set()
+                                if os.path.exists(verified_cache_path):
+                                    try:
+                                        with open(verified_cache_path, 'r', encoding='utf-8') as vfh:
+                                            for ln in vfh:
+                                                ln = ln.strip()
+                                                if ln:
+                                                    existing.add(ln)
+                                    except Exception:
+                                        pass
+                                if username not in existing:
+                                    try:
+                                        os.makedirs(os.path.dirname(verified_cache_path) or outdir, exist_ok=True)
+                                        with open(verified_cache_path, 'a', encoding='utf-8') as vfh:
+                                            vfh.write(username + "\n")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        return bool(verified), bioj
+                except Exception:
+                    pass
+            
+            # 3. Network fetch if not skipped
+            if not skip_network:
+                try:
+                    profile_data = fetch_user_profile(username, token=token, user_agent=user_agent, raw_oauth=True)
+                    verified = bool(profile_data.get("data", {}).get("verified"))
+                    if verified and username not in checked_users:
+                        early_log_func("INFO", "✓ %s", username)
+                        if logger_func:
+                            logger_func("✓ %s", username)
+                        checked_users.add(username)
+                        # append to verified cache
+                        try:
+                            existing = set()
+                            if os.path.exists(verified_cache_path):
+                                try:
+                                    with open(verified_cache_path, 'r', encoding='utf-8') as vfh:
+                                        for ln in vfh:
+                                            ln = ln.strip()
+                                            if ln:
+                                                existing.add(ln)
+                                except Exception:
+                                    pass
+                            if username not in existing:
+                                try:
+                                    os.makedirs(os.path.dirname(verified_cache_path) or outdir, exist_ok=True)
+                                    with open(verified_cache_path, 'a', encoding='utf-8') as vfh:
+                                        vfh.write(username + "\n")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    elif not verified and username not in checked_users:
+                        early_log_func("INFO", "✗ %s", username)
+                        if logger_func:
+                            logger_func("✗ %s", username)
+                        checked_users.add(username)
+                    return verified, profile_data
+                except Exception:
+                    pass
+            
+            return False, None
+        except Exception:
+            return False, None
+
+    # If user requested saving bios, fetch them via the helper and save JSON files
+    if getattr(args, "save_bio", False):
+        # Expect --user to be provided (one or more)
+        users = []
+        if getattr(args, "user", None):
+            for user_arg in args.user:
+                for u in user_arg.split(','):
+                    if u.strip():
+                        users.append(u.strip().lstrip('/@ '))
+
+        # If no explicit --user values were provided, allow --subreddit to supply authors
+        if not users:
+            # support --subreddit to collect authors from subreddit posts
+            if getattr(args, "subreddit", None):
+                authors_set = set()
+                # determine per-subreddit max posts: prefer CLI --max-posts if present
+                sub_max = args.max_posts or reddit_cfg.get("default_max_posts") or 100
+                for sub_arg in args.subreddit:
+                    for r in sub_arg.split(','):
+                        if not r.strip():
+                            continue
+                        rname = r.strip().lstrip("/ r")
+                        url = f"https://www.reddit.com/r/{rname}/"
+                        try:
+                            _early_console_log("INFO", "Fetching posts from subreddit: %s (up to %s posts)", rname, sub_max)
+                        except Exception:
+                            pass
+                        try:
+                            posts, pages = fetch_posts_with_pagination(url, token, user_agent, paginate=True, max_posts=sub_max, per_page=args.per_page, debug=getattr(args, 'debug', False), sort=getattr(args, 'sort', None))
+                            try:
+                                _early_console_log("INFO", "Fetched %d posts (pages=%s) from %s", len(posts), pages, rname)
+                            except Exception:
+                                pass
+                            for child in posts:
+                                try:
+                                    a = child.get("data", {}).get("author")
+                                    if a and a.strip():
+                                        authors_set.add(a.strip())
+                                except Exception:
+                                    continue
+                        except Exception as e:
+                            try:
+                                logging.getLogger(__name__).warning("Failed to fetch subreddit %s for --save-bio: %s", rname, e)
+                            except Exception:
+                                pass
+                if authors_set:
+                    users = sorted(authors_set)
+                    try:
+                        logging.getLogger(__name__).info("Collected %d unique authors from --subreddit for --save-bio", len(users))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        logging.getLogger(__name__).error(json.dumps({"error": "--save-bio found no authors in provided --subreddit(s)"}))
+                    except Exception:
+                        pass
+                    sys.exit(2)
+            else:
+                logging.getLogger(__name__).error(json.dumps({"error": "--save-bio requires --user <username> or --subreddit <name>"}))
+                sys.exit(2)
+        # Save compact profile JSON into single folder: <outdir>/user_bio/<username>.json
+        bio_dir = os.path.join(outdir, "user_bio")
+        os.makedirs(bio_dir, exist_ok=True)
+    # use shared checked_users set defined above to avoid duplicate prints
+
+        for uname in users:
+            outpath = os.path.join(bio_dir, f"{_sanitize_filename(uname)}.json")
+            failed_path = outpath + ".failed"
+            
+            # If file already exists, log and skip fetching
+            try:
+                if os.path.exists(outpath):
+                    # Check verification status and create combined log message
+                    verified_status = "?"
+                    if uname not in checked_users:
+                        verified, _ = _check_user_verified(uname, outdir, token, user_agent, checked_users, 
+                                                         lambda *args: None,  # Silent verification check
+                                                         lambda *args: None, skip_network=True)
+                        verified_status = "✓ cached" if verified else "✗"
+                    else:
+                        # User already processed, check if in verified cache
+                        verified_cache_path = os.path.join(outdir, "verified_authors.txt")
+                        if os.path.exists(verified_cache_path):
+                            try:
+                                with open(verified_cache_path, "r", encoding="utf-8") as vfh:
+                                    for ln in vfh:
+                                        if ln.strip() == uname:
+                                            verified_status = "✓ cached"
+                                            break
+                                    else:
+                                        verified_status = "✗"
+                            except Exception:
+                                verified_status = "?"
+                    
+                    try:
+                        logging.getLogger(__name__).info("Bio exists: %s (%s)", uname, verified_status)
+                    except Exception:
+                        pass
+                    try:
+                        _early_console_log("INFO", "Bio exists: %s (%s)", uname, verified_status)
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
+
+            try:
+                j = fetch_user_profile(uname, token=token, user_agent=user_agent, raw_oauth=False)
+                try:
+                    with open(outpath, "w", encoding="utf-8") as fh:
+                        json.dump(j, fh, ensure_ascii=False, indent=2)
+                    # Determine verification status for combined log
+                    verified_status = "✗"
+                    try:
+                        is_verified = None
+                        if isinstance(j, dict):
+                            if 'verified' in j:
+                                is_verified = bool(j.get('verified'))
+                            else:
+                                is_verified = bool(j.get('data', {}).get('verified'))
+                        if is_verified:
+                            verified_status = "✓ new"
+                    except Exception:
+                        pass
+                    
+                    try:
+                        logging.getLogger(__name__).info("Bio saved: %s (%s)", uname, verified_status)
+                    except Exception:
+                        pass
+                    try:
+                        _early_console_log("INFO", "Bio saved: %s (%s)", uname, verified_status)
+                    except Exception:
+                        pass
+                    # Check verified status and cache using helper (but use the fresh profile data)
+                    try:
+                        is_verified = None
+                        if isinstance(j, dict):
+                            if 'verified' in j:
+                                is_verified = bool(j.get('verified'))
+                            else:
+                                is_verified = bool(j.get('data', {}).get('verified'))
+                        if is_verified:
+                            verified_cache_path = os.path.join(outdir, "verified_authors.txt")
+                            existing = set()
+                            if os.path.exists(verified_cache_path):
+                                try:
+                                    with open(verified_cache_path, 'r', encoding='utf-8') as vfh:
+                                        for ln in vfh:
+                                            ln = ln.strip()
+                                            if ln:
+                                                existing.add(ln)
+                                except Exception:
+                                    pass
+                            if uname not in existing:
+                                try:
+                                    os.makedirs(os.path.dirname(verified_cache_path) or outdir, exist_ok=True)
+                                    with open(verified_cache_path, 'a', encoding='utf-8') as vfh:
+                                        vfh.write(uname + "\n")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        with open(failed_path, "w", encoding="utf-8") as fh:
+                            fh.write("write_error")
+                    except Exception:
+                        pass
+                    try:
+                        logging.getLogger(__name__).error("Failed to write bio: %s", outpath)
+                    except Exception:
+                        pass
+                    try:
+                        _early_console_log("ERROR", "Failed to write bio: %s", outpath)
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    with open(failed_path, "w", encoding="utf-8") as fh:
+                        fh.write("fetch_error")
+                except Exception:
+                    pass
+                try:
+                    logging.getLogger(__name__).error("Failed to fetch bio for %s", uname)
+                except Exception:
+                    pass
+                try:
+                    _early_console_log("ERROR", "Failed to fetch bio for %s", uname)
+                except Exception:
+                    pass
+
+        # continue to downloads after saving bios
+
+    # If --only-verified was requested, and users were provided, pre-filter the user list
+    # by querying the helper script for their profile and checking the `verified` field.
+    if getattr(args, "only_verified", False) and getattr(args, "user", None):
+        # Build list of usernames expanded from args.user
+        candidate_users = []
+        for user_arg in args.user:
+            for u in user_arg.split(','):
+                if u.strip():
+                    candidate_users.append(u.strip().lstrip('/@ '))
+
+        verified_users = []
+        # `fetch_user_profile` is required and imported at module level.
+        # prepare verified authors cache file path and load existing entries
+        verified_cache_path = os.path.join(outdir, "verified_authors.txt")
+        existing_verified_cache = set()
+        try:
+            if os.path.exists(verified_cache_path):
+                with open(verified_cache_path, "r", encoding="utf-8") as fh:
+                    for ln in fh:
+                        ln = ln.strip()
+                        if ln:
+                            existing_verified_cache.add(ln)
+        except Exception:
+            existing_verified_cache = set()
+
+        for uname in candidate_users:
+            try:
+                verified, _ = _check_user_verified(
+                    uname, outdir, token, user_agent, checked_users, _early_console_log,
+                    lambda msg, *args: logging.getLogger(__name__).info(msg, *args)
+                )
+                if verified:
+                    verified_users.append(uname)
+                    existing_verified_cache.add(uname)
+            except Exception:
+                try:
+                    logging.getLogger(__name__).warning("Error while checking verified status for %s", uname)
+                except Exception:
+                    pass
+                continue
+
+        # Replace args.user with only the verified usernames (if any). If none verified, exit early.
+        if not verified_users:
+            try:
+                logging.getLogger(__name__).info("No verified users found; nothing to do.")
+            except Exception:
+                pass
+            logging.getLogger(__name__).error(json.dumps({"error": "No verified users found; nothing to do."}))
+            return
+        # rewrite args.user in-place to contain only the verified ones (as list)
+        args.user = verified_users
+        try:
+            logging.getLogger(__name__).info("Users kept for processing: %s", ', '.join(verified_users))
+        except Exception:
+            pass
     # default max posts when neither --max-posts nor --all is provided
     try:
         default_max_posts = int(os.environ.get("REDDIT_DL_DEFAULT_MAX_POSTS") or reddit_cfg.get("default_max_posts") or 500)
@@ -1449,6 +1843,112 @@ def main(argv=None):
         logger.info("Saving metadata and media to %s", source_dir)
         stats["posts_processed"] += len(posts)
 
+        # If --only-verified and we're processing a subreddit, filter posts to only those
+        # whose authors are verified according to the profile helper.
+        if getattr(args, "only_verified", False) and source_name.startswith("r_"):
+            # collect unique authors from posts
+            authors = []
+            for child in posts:
+                try:
+                    a = child.get("data", {}).get("author")
+                    if a and a not in authors:
+                        authors.append(a)
+                except Exception:
+                    continue
+
+            author_verified = {}
+            # Prepare disk-backed cache of previously-verified authors to reduce API hits
+            try:
+                cache_file = os.path.join(outdir, "verified_authors.txt")
+                os.makedirs(os.path.dirname(cache_file) or outdir, exist_ok=True)
+                existing_verified = set()
+                if os.path.exists(cache_file):
+                    try:
+                        with open(cache_file, "r", encoding="utf-8") as fh:
+                            for ln in fh:
+                                ln = ln.strip()
+                                if ln:
+                                    existing_verified.add(ln)
+                    except Exception:
+                        existing_verified = set()
+                else:
+                    existing_verified = set()
+            except Exception:
+                cache_file = None
+                existing_verified = set()
+            # `fetch_user_profile` is imported at module level and required for verification.
+            new_verified_to_append = []
+            # load verified cache for authors (reuse verified_cache_path)
+            existing_verified = set()
+            try:
+                if os.path.exists(verified_cache_path):
+                    with open(verified_cache_path, "r", encoding="utf-8") as fh:
+                        for ln in fh:
+                            ln = ln.strip()
+                            if ln:
+                                existing_verified.add(ln)
+            except Exception:
+                existing_verified = set()
+
+            for a in authors:
+                if not a:
+                    continue
+                # consult disk cache first
+                if a in existing_verified:
+                    author_verified[a] = True
+                    continue
+                try:
+                    # Use a no-op early log function to avoid duplicate console output when combined with --save-bio
+                    verified, _ = _check_user_verified(
+                        a, outdir, token, user_agent, checked_users, 
+                        lambda level, fmt, *args: None,  # No console output for subreddit verification
+                        lambda msg, *args: logging.getLogger(__name__).debug(msg, *args)
+                    )
+                    author_verified[a] = bool(verified)
+                    if author_verified[a]:
+                        new_verified_to_append.append(a)
+                except Exception:
+                    author_verified[a] = False
+
+            # Persist any newly-discovered verified authors to cache file (append)
+            if cache_file and new_verified_to_append:
+                try:
+                    # also update the global verified_authors cache file so future runs can use it
+                    with open(cache_file, "a", encoding="utf-8") as fh:
+                        for v in new_verified_to_append:
+                            try:
+                                fh.write(v + "\n")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            try:
+                # ensure the outdir-level verified_authors.txt also includes newly verified
+                if new_verified_to_append:
+                    with open(verified_cache_path, "a", encoding="utf-8") as fh2:
+                        for v in new_verified_to_append:
+                            try:
+                                fh2.write(v + "\n")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # Now filter posts in-place
+            filtered_posts = []
+            for child in posts:
+                try:
+                    a = child.get("data", {}).get("author")
+                    if a and author_verified.get(a):
+                        filtered_posts.append(child)
+                    else:
+                        # skip non-verified author post
+                        continue
+                except Exception:
+                    continue
+            posts = filtered_posts
+            logger.info("After --only-verified filter: %d posts remain for %s", len(posts), url)
+
         # For each post, optionally save post JSON and download its media into the source root
         # (metadata and media files will be placed directly under `source_dir`).
         # Avoid writing per-post JSON for comment nodes (they produce noisy "No media" lines).
@@ -1528,6 +2028,7 @@ def main(argv=None):
             # Flatten tasks (prefix each url with its target folder and post_id) and download in parallel
             tasks = []
             for post_id, (urls, meta_path, ctx_label) in post_urls_map.items():
+                # create one task per media URL for this post
                 for u in urls:
                     # folder will be source_dir; include meta_path and context_label for logging
                     tasks.append((source_dir, post_id, u, meta_path, ctx_label))
@@ -1537,6 +2038,11 @@ def main(argv=None):
             total_media = sum(len(urls) for (urls, _meta, _ctx) in post_urls_map.values())
             logging.getLogger(__name__).info("Downloading %d media files with concurrency=%s, rate=%s/s", total_media, concurrency, rate)
             stats["media_attempted"] += total_media
+            # If user requested only saving metadata, skip actual downloads
+            if getattr(args, 'save_meta_only', False):
+                # When only saving metadata, do not schedule downloads for this source.
+                # No profile checks are required here.
+                continue
             # Compact pre-scan: check index and skip scheduling for known MD5s (best-effort, no file copies)
             try:
                 if idx and tasks:
@@ -1557,11 +2063,11 @@ def main(argv=None):
                                     continue
                         try:
                             norm_u = normalize_media_url(u)
-                            existing_md5 = idx.get_md5_for_url(norm_u)
+                            md5, existing_path = idx.lookup_by_normalized_url(norm_u)
                         except Exception:
                             remaining.append(item)
                             continue
-                        if not existing_md5:
+                        if not md5 or not existing_path:
                             remaining.append(item)
                             continue
                         # mark skipped immediately and log (no network/file ops)
@@ -1637,61 +2143,25 @@ def main(argv=None):
                     # quick URL-based skip: if we've seen this URL before and it maps to an md5,
                     # and the md5 already exists in our index, skip downloading
                     norm_u = normalize_media_url(u)
-                    existing_md5 = None
                     try:
-                        if idx:
-                            existing_md5 = idx.get_md5_for_url(norm_u)
+                        md5, existing_path = idx.lookup_by_normalized_url(norm_u) if idx else (None, None)
                     except Exception:
-                        existing_md5 = None
+                        md5, existing_path = (None, None)
 
-                    if existing_md5:
-                        # find an existing file path for this md5; if found, copy into per-post folder
-                        candidate_paths = []
+                    if md5 and existing_path:
+                        # copy existing into per-post folder if possible
                         try:
-                            candidate_paths = idx.get_paths_for_md5(existing_md5) if idx else []
+                            target_path = idx.copy_existing_to_folder(md5, folder, post_id)
+                            if target_path:
+                                try:
+                                    stats["recovered"] += 1
+                                except Exception:
+                                    pass
+                                return _skipped_return(target_path)
+                            else:
+                                return _skipped_return(existing_path)
                         except Exception:
-                            candidate_paths = []
-                        found = None
-                        for p in candidate_paths:
-                            try:
-                                if os.path.exists(p):
-                                    found = p
-                                    break
-                            except Exception:
-                                continue
-                        if found:
-                            # ensure the per-post file exists: if not, copy existing file into folder using post_id
-                            try:
-                                _, ext = os.path.splitext(found)
-                                target_name = _sanitize_filename(post_id) + ext
-                                target_path = os.path.join(folder, target_name)
-                                if not os.path.exists(target_path):
-                                    try:
-                                        shutil.copy2(found, target_path)
-                                        # record in sqlite
-                                        try:
-                                            idx.add_path_for_md5(existing_md5, target_path)
-                                        except Exception:
-                                            pass
-                                        try:
-                                            stats["recovered"] += 1
-                                        except Exception:
-                                            pass
-                                        return _skipped_return(target_path)
-                                    except Exception:
-                                        return _skipped_return(found)
-                                else:
-                                    return _skipped_return(target_path)
-                            except Exception:
-                                return _skipped_return(found)
-                        # No local file exists but md5 is known in the index — respect the index and skip re-download.
-                        # Map URL -> md5 in sqlite and return skipped.
-                        try:
-                            if idx:
-                                idx.set_url_md5(norm_u, existing_md5)
-                        except Exception:
-                            pass
-                        return _skipped_return(folder)
+                            return _skipped_return(existing_path)
 
                     cl = None
                     etag = None
@@ -1705,84 +2175,46 @@ def main(argv=None):
 
                     # If we have an ETag from HEAD, check if we've seen it before
                     if etag:
-                        mapped = None
                         try:
-                            if idx:
-                                mapped = idx.get_md5_for_etag(etag)
+                            mapped_md5, mapped_path = idx.find_by_etag(etag) if idx else (None, None)
                         except Exception:
-                            mapped = None
-
-                        if mapped:
-                            candidate_paths = []
+                            mapped_md5, mapped_path = (None, None)
+                        if mapped_md5 and mapped_path:
                             try:
-                                candidate_paths = idx.get_paths_for_md5(mapped) if idx else []
+                                # prefer to copy existing into per-post folder
+                                target_path = idx.copy_existing_to_folder(mapped_md5, folder, post_id)
+                                if target_path:
+                                    try:
+                                        stats["recovered"] += 1
+                                    except Exception:
+                                        pass
+                                    return _skipped_return(target_path)
+                                else:
+                                    return _skipped_return(mapped_path)
                             except Exception:
-                                candidate_paths = []
-                            found = None
-                            for p in candidate_paths:
-                                try:
-                                    if os.path.exists(p):
-                                        found = p
-                                        break
-                                except Exception:
-                                    continue
-                            if found:
-                                # map normalized URL to md5
-                                try:
-                                    if idx:
-                                        idx.set_url_md5(norm_u, mapped)
-                                except Exception:
-                                    pass
-                                # ensure per-post file exists; copy if necessary
-                                try:
-                                    _, ext = os.path.splitext(found)
-                                    target_name = _sanitize_filename(post_id) + ext
-                                    target_path = os.path.join(folder, target_name)
-                                    if not os.path.exists(target_path):
-                                        try:
-                                            shutil.copy2(found, target_path)
-                                            try:
-                                                idx.add_path_for_md5(mapped, target_path)
-                                            except Exception:
-                                                pass
-                                            try:
-                                                stats["recovered"] += 1
-                                            except Exception:
-                                                pass
-                                            return _skipped_return(target_path)
-                                        except Exception:
-                                            return _skipped_return(found)
-                                    else:
-                                        return _skipped_return(target_path)
-                                except Exception:
-                                    return _skipped_return(found)
-                            # mapped md5 exists but no local path found: skip without creating any marker file
-                            try:
-                                if idx:
-                                    idx.set_url_md5(norm_u, mapped)
-                            except Exception:
-                                pass
+                                return _skipped_return(mapped_path)
+                        try:
+                            if idx and mapped_md5:
+                                idx.set_url_md5(norm_u, mapped_md5)
+                        except Exception:
+                            pass
+                        if mapped_md5:
                             return _skipped_return(folder)
                     # If we don't have a URL or ETag match, and we have a Content-Length, try size-based match
                     if args.head_check and cl:
                         try:
-                            # iterate known md5s and their paths
-                            for md5, p in idx.iter_md5_paths():
+                            md5_by_size, path_by_size = idx.find_by_size(cl) if idx else (None, None)
+                            if md5_by_size and path_by_size:
                                 try:
-                                    if os.path.exists(p) and os.path.getsize(p) == cl:
-                                        # found a file with same size; assume identical and map URL -> md5
-                                        try:
-                                            idx.set_url_md5(norm_u, md5)
-                                        except Exception:
-                                            pass
-                                        if etag:
-                                            try:
-                                                idx.set_etag_md5(etag, md5)
-                                            except Exception:
-                                                pass
-                                        return folder, post_id, u, p, True, context_label
+                                    idx.set_url_md5(norm_u, md5_by_size)
                                 except Exception:
-                                    continue
+                                    pass
+                                if etag:
+                                    try:
+                                        idx.set_etag_md5(etag, md5_by_size)
+                                    except Exception:
+                                        pass
+                                return folder, post_id, u, path_by_size, True, context_label
                         except Exception:
                             pass
 
@@ -1812,61 +2244,13 @@ def main(argv=None):
                                 remote_fp = None
                             if remote_fp:
                                 try:
-                                    # first, check persistent fp->md5 mapping (fast)
-                                    mapped_md5 = None
-                                    try:
-                                        mapped_md5 = idx.get_md5_for_fp(remote_fp) if idx else None
-                                    except Exception:
-                                        mapped_md5 = None
-                                    if mapped_md5:
-                                        # found mapping; try to find a path for this md5
-                                        candidate_paths = []
+                                    mapped_md5, mapped_path = idx.find_by_partial_fp(remote_fp, _partial_cache, partial_size) if idx else (None, None)
+                                    if mapped_md5 and mapped_path:
                                         try:
-                                            candidate_paths = idx.get_paths_for_md5(mapped_md5) if idx else []
+                                            idx.set_url_md5(norm_u, mapped_md5)
                                         except Exception:
-                                            candidate_paths = []
-                                        found = None
-                                        for p in candidate_paths:
-                                            try:
-                                                if os.path.exists(p):
-                                                    found = p
-                                                    break
-                                            except Exception:
-                                                continue
-                                        if found:
-                                            try:
-                                                idx.set_url_md5(norm_u, mapped_md5)
-                                            except Exception:
-                                                pass
-                                            return _skipped_return(found)
-
-                                    # fallback: lazily compute partial fingerprints for existing md5 files
-                                    for md5, p in idx.iter_md5_paths():
-                                        if md5 in _partial_cache:
-                                            local_fp = _partial_cache[md5]
-                                        else:
-                                            local_fp = None
-                                            try:
-                                                if os.path.exists(p):
-                                                    with open(p, "rb") as fh:
-                                                        data = fh.read(partial_size)
-                                                        from hashlib import sha256
-                                                        local_fp = sha256(data).hexdigest()
-                                                        _partial_cache[md5] = local_fp
-                                            except Exception:
-                                                local_fp = None
-                                        if local_fp and local_fp == remote_fp:
-                                            # match found
-                                            try:
-                                                idx.set_url_md5(norm_u, md5)
-                                            except Exception:
-                                                pass
-                                            # persist mapping fp -> md5 for faster future lookups
-                                            try:
-                                                idx.set_fp_md5(remote_fp, md5)
-                                            except Exception:
-                                                pass
-                                            return _skipped_return(p)
+                                            pass
+                                        return _skipped_return(mapped_path)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1877,100 +2261,56 @@ def main(argv=None):
                     if not dst.endswith('.failed'):
                         md5 = compute_md5(dst)
                         if md5 and idx:
-                            # Post-download dedupe: if this md5 already exists in the index
-                            # and points to an existing file, delete the newly-downloaded
-                            # file and treat it as skipped to avoid duplicate storage.
+                            # Delegate post-download dedupe/recording to Md5Index methods
                             try:
-                                # Use helper to find an existing file for this md5 and prune stale DB paths
-                                existing_found = idx.get_existing_path_for_md5(md5) if idx else None
+                                is_dup, existing = idx.dedupe_after_download(md5, dst, norm_u)
                             except Exception:
-                                existing_found = None
-                            if existing_found and existing_found != dst:
-                                # remove the newly downloaded duplicate file
-                                try:
-                                    os.remove(dst)
-                                except Exception:
-                                    pass
+                                is_dup, existing = (False, None)
+                            if is_dup:
                                 try:
                                     stats["media_skipped"] += 1
                                 except Exception:
                                     pass
-                                # Pretty host label for logs (try to reuse context_label if available)
-                                try:
-                                    if context_label:
-                                        host_label = context_label
-                                    else:
-                                        from urllib.parse import urlparse
-                                        lh = (urlparse(u).hostname or "").lower()
-                                        if "redgifs" in lh:
-                                            host_label = "Redgifs"
-                                        elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
-                                            host_label = "Redd.it"
-                                        else:
-                                            parts = lh.split('.') if lh else []
-                                            host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
-                                except Exception:
-                                    host_label = "Unknown"
-                                # compute md5 for the deleted file if possible (may be missing since file removed)
-                                md5_val = None
-                                try:
-                                    # prefer computing from existing index entry
-                                    md5_val = existing_found and compute_md5(existing_found)
-                                except Exception:
-                                    md5_val = None
                                 try:
                                     if getattr(args, 'debug', False):
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dst), md5_val)
+                                        host_label = context_label or 'Unknown'
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dst), md5)
                                     else:
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, os.path.basename(dst))
-                                except Exception:
-                                    pass
-                                # ensure the URL -> md5 mapping exists
-                                try:
-                                    idx.set_url_md5(norm_u, md5)
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] %s", post_id, os.path.basename(dst))
                                 except Exception:
                                     pass
                             else:
                                 try:
-                                    idx.set_url_md5(norm_u, md5)
+                                    # record ETag if available
+                                    _, resp_etag = head_check(u, user_agent)
+                                    if resp_etag:
+                                        try:
+                                            idx.set_etag_md5(resp_etag, md5)
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
                                 try:
-                                    idx.add_path_for_md5(md5, dst)
+                                    if partial_enabled:
+                                        from hashlib import sha256
+                                        with open(dst, 'rb') as _fh:
+                                            data = _fh.read(partial_size)
+                                            if data:
+                                                fp = sha256(data).hexdigest()
+                                                try:
+                                                    idx.set_fp_md5(fp, md5)
+                                                except Exception:
+                                                    pass
                                 except Exception:
                                     pass
-                            # capture ETag if present in last HEAD or response headers (best-effort)
-                            try:
-                                _, resp_etag = head_check(u, user_agent)
-                                if resp_etag:
+                                # periodic checkpoint (optional)
+                                downloads_since_save += 1
+                                if downloads_since_save >= save_interval:
                                     try:
-                                        idx.set_etag_md5(resp_etag, md5)
+                                        idx.checkpoint()
                                     except Exception:
                                         pass
-                            except Exception:
-                                pass
-                            # persist partial fingerprint for this md5 to speed future runs
-                            try:
-                                if partial_enabled:
-                                    from hashlib import sha256
-                                    with open(dst, 'rb') as _fh:
-                                        data = _fh.read(partial_size)
-                                        if data:
-                                            fp = sha256(data).hexdigest()
-                                            try:
-                                                idx.set_fp_md5(fp, md5)
-                                            except Exception:
-                                                pass
-                            except Exception:
-                                pass
-                            # periodic checkpoint (optional)
-                            downloads_since_save += 1
-                            if downloads_since_save >= save_interval:
-                                try:
-                                    idx.checkpoint()
-                                except Exception:
-                                    pass
-                                downloads_since_save = 0
+                                    downloads_since_save = 0
                     return folder, post_id, u, dst, False, context_label
 
                 futures = {ex.submit(worker_item_with_rate, item): item for item in tasks}

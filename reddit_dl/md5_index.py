@@ -11,7 +11,11 @@ import json
 import os
 import sqlite3
 import threading
+import re
 from typing import Iterable, List, Optional, Tuple
+import shutil
+import hashlib
+from typing import Dict
 
 
 class Md5Index:
@@ -25,8 +29,20 @@ class Md5Index:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        # Keep durability reasonable but not too slow. WAL provides better
+        # concurrent readers/writers. Use NORMAL synchronous for speed.
         self._conn.execute("PRAGMA synchronous=NORMAL;")
+        # Keep temp tables in memory for performance
         self._conn.execute("PRAGMA temp_store=MEMORY;")
+        # Ask SQLite to automatically checkpoint the WAL after a small
+        # number of pages so the -wal file doesn't grow indefinitely. The
+        # value here is a trade-off: lower means more frequent checkpoints
+        # (safer for crashes) but more work. 200 pages is modest.
+        try:
+            self._conn.execute("PRAGMA wal_autocheckpoint = 200;")
+        except Exception:
+            # older SQLite versions may not support this pragma; ignore
+            pass
         self._create_tables()
 
     def _create_tables(self) -> None:
@@ -75,8 +91,27 @@ class Md5Index:
     def close(self) -> None:
         try:
             with self._lock:
-                self._conn.commit()
-                self._conn.close()
+                # Commit pending transactions, then attempt a WAL checkpoint
+                # to merge the -wal into the main database file. This is
+                # best-effort: if the program is killed with SIGKILL the
+                # checkpoint won't run, but for normal shutdowns this helps
+                # reduce the risk of leftover -wal/-shm files and lost
+                # recent writes.
+                try:
+                    self._conn.commit()
+                    # FULL checkpoint blocks until all writers finish and
+                    # merges WAL to the main DB file.
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+                    except Exception:
+                        # ignore checkpoint failures
+                        pass
+                finally:
+                    # Always try to close the connection
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -240,5 +275,181 @@ class Md5Index:
         # checkpoint after bulk load
         try:
             self.checkpoint()
+        except Exception:
+            pass
+
+    # High-level smart deduplication helpers
+    def lookup_by_normalized_url(self, norm_url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (md5, existing_path) for a normalized URL if present and the file exists.
+
+        Returns (None, None) when no mapping exists or mapped paths are missing.
+        """
+        try:
+            md5 = self.get_md5_for_url(norm_url)
+            if not md5:
+                return None, None
+            path = self.get_existing_path_for_md5(md5)
+            if path:
+                return md5, path
+        except Exception:
+            pass
+        return None, None
+
+    def find_by_etag(self, etag: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (md5, existing_path) for a given ETag if present and file exists."""
+        try:
+            md5 = self.get_md5_for_etag(etag)
+            if not md5:
+                return None, None
+            path = self.get_existing_path_for_md5(md5)
+            if path:
+                return md5, path
+        except Exception:
+            pass
+        return None, None
+
+    def find_by_size(self, size: int) -> Tuple[Optional[str], Optional[str]]:
+        """Return first (md5, path) whose file size matches `size`.
+
+        This is a heuristic fallback and may return false positives for coincidental sizes.
+        """
+        try:
+            for md5, p in self.iter_md5_paths():
+                try:
+                    if os.path.exists(p) and os.path.getsize(p) == int(size):
+                        return md5, p
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+
+    def find_by_partial_fp(self, remote_fp: str, partial_cache: Dict[str, str], partial_size: int) -> Tuple[Optional[str], Optional[str]]:
+        """Try to match a partial fingerprint to a known md5 and existing path.
+
+        - Checks persistent fp->md5 mappings first.
+        - Falls back to computing partial fingerprints for known files and caching them in `partial_cache`.
+        Returns (md5, path) on match or (None, None).
+        """
+        if not remote_fp:
+            return None, None
+        try:
+            mapped = self.get_md5_for_fp(remote_fp)
+            if mapped:
+                path = self.get_existing_path_for_md5(mapped)
+                if path:
+                    return mapped, path
+        except Exception:
+            pass
+
+        try:
+            for md5, p in self.iter_md5_paths():
+                try:
+                    if md5 in partial_cache:
+                        local_fp = partial_cache[md5]
+                    else:
+                        local_fp = None
+                        if os.path.exists(p):
+                            with open(p, 'rb') as fh:
+                                data = fh.read(partial_size)
+                                local_fp = hashlib.sha256(data).hexdigest()
+                                partial_cache[md5] = local_fp
+                    if local_fp and local_fp == remote_fp:
+                        # record mapping for faster future lookups
+                        try:
+                            self.set_fp_md5(remote_fp, md5)
+                        except Exception:
+                            pass
+                        return md5, p
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None, None
+
+    def copy_existing_to_folder(self, md5: str, folder: str, post_id: Optional[str]) -> Optional[str]:
+        """Copy an existing path for `md5` into `folder` using `post_id` as filename.
+
+        Returns the target path on success, or None on failure.
+        """
+        try:
+            path = self.get_existing_path_for_md5(md5)
+            if not path:
+                return None
+            _, ext = os.path.splitext(path)
+            target_name = (post_id and re.sub(r"[^A-Za-z0-9._-]", "_", post_id)) or os.path.basename(path)
+            target_path = os.path.join(folder, target_name + ext) if not target_name.endswith(ext) else os.path.join(folder, target_name)
+            try:
+                os.makedirs(os.path.dirname(target_path) or folder, exist_ok=True)
+            except Exception:
+                pass
+            if not os.path.exists(target_path):
+                shutil.copy2(path, target_path)
+                try:
+                    self.add_path_for_md5(md5, target_path)
+                except Exception:
+                    pass
+            return target_path
+        except Exception:
+            return None
+
+    def dedupe_after_download(self, md5: str, dst: str, norm_url: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """After downloading a file at `dst`, check if an existing file for `md5` already exists.
+
+        If an existing file exists and differs from `dst`, `dst` will be removed and
+        the function returns (True, existing_path). Otherwise the function records
+        `dst` in the index and returns (False, dst).
+        """
+        try:
+            existing = self.get_existing_path_for_md5(md5)
+            if existing and os.path.abspath(existing) != os.path.abspath(dst):
+                # remove duplicate
+                try:
+                    os.remove(dst)
+                except Exception:
+                    pass
+                # ensure url mapping exists (caller may provide norm_url)
+                try:
+                    if norm_url:
+                        self.set_url_md5(norm_url, md5)
+                except Exception:
+                    pass
+                return True, existing
+            # No existing duplicate found: record dst
+            try:
+                if norm_url:
+                    self.set_url_md5(norm_url, md5)
+            except Exception:
+                pass
+            try:
+                self.add_path_for_md5(md5, dst)
+            except Exception:
+                pass
+            return False, dst
+        except Exception:
+            return False, dst
+
+    def record_download(self, md5: str, norm_url: Optional[str], path: str, resp_etag: Optional[str] = None, fp: Optional[str] = None) -> None:
+        """Convenience to record URL->md5, add path and optional etag/fingerprint mappings."""
+        try:
+            if norm_url:
+                try:
+                    self.set_url_md5(norm_url, md5)
+                except Exception:
+                    pass
+            try:
+                self.add_path_for_md5(md5, path)
+            except Exception:
+                pass
+            if resp_etag:
+                try:
+                    self.set_etag_md5(resp_etag, md5)
+                except Exception:
+                    pass
+            if fp:
+                try:
+                    self.set_fp_md5(fp, md5)
+                except Exception:
+                    pass
         except Exception:
             pass
