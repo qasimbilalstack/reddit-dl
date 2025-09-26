@@ -1,7 +1,28 @@
 """SQLite-backed MD5 index for reddit-dl.
 
 Provides a small thread-safe API for mapping normalized URLs and ETags to md5
-and mapping md5 -> local file paths. Uses WAL mode for cheap, safe updates.
+and mapping md5 -> local file paths. Uses WAL    def get_failed_urls_count(self) -> int:
+        \"\"\"Get the total number of failed URLs tracked.\"\"\"
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute(\"SELECT COUNT(*) FROM failed_urls\")
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception:
+            return 0
+
+    def clear_failed_urls(self) -> int:
+        \"\"\"Clear all failed URLs from tracking. Returns number of URLs cleared.\"\"\"
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute(\"DELETE FROM failed_urls\")
+                count = cur.rowcount
+                self._conn.commit()
+                return count
+        except Exception:
+            return 0cheap, safe updates.
 
 This is intentionally lightweight and keeps a simple sqlite3 schema.
 """
@@ -86,6 +107,16 @@ class Md5Index:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS failed_urls (
+                    url TEXT PRIMARY KEY,
+                    failed_at INTEGER,
+                    reason TEXT,
+                    attempts INTEGER DEFAULT 1
+                )
+                """
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -114,6 +145,56 @@ class Md5Index:
                         pass
         except Exception:
             pass
+
+    def is_url_failed(self, url: str) -> bool:
+        """Check if a URL has previously failed to download."""
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("SELECT 1 FROM failed_urls WHERE url = ?", (url,))
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def record_failed_url(self, url: str, reason: str = "download_failed") -> None:
+        """Record a URL as failed with the failure reason."""
+        try:
+            import time
+            with self._lock:
+                cur = self._conn.cursor()
+                # Insert or update the failure record
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO failed_urls (url, failed_at, reason, attempts)
+                    VALUES (?, ?, ?, 
+                        COALESCE((SELECT attempts FROM failed_urls WHERE url = ?), 0) + 1)
+                    """,
+                    (url, int(time.time()), reason, url)
+                )
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def remove_failed_url(self, url: str) -> None:
+        """Remove a URL from the failed list (e.g., after successful retry)."""
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("DELETE FROM failed_urls WHERE url = ?", (url,))
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def get_failed_urls_count(self) -> int:
+        """Get the total number of failed URLs tracked."""
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM failed_urls")
+                result = cur.fetchone()
+                return result[0] if result else 0
+        except Exception:
+            return 0
 
     def checkpoint(self) -> None:
         # allow callers to checkpoint WAL if they want; best-effort

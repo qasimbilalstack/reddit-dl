@@ -32,6 +32,9 @@ DEFAULT_USER_AGENT = "reddit-dl/0.1 (by /u/yourusername)"
 # simple in-memory token cache: {client_id: (token, expires_at)}
 _TOKEN_CACHE = {}
 
+# Global parsed arguments (populated in main())
+args = None
+
 
 class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Custom formatter for better help text alignment and spacing."""
@@ -953,6 +956,34 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
     # unescape HTML entities (Reddit preview URLs often contain &amp;)
     url = url.replace("&amp;", "&")
 
+    # If user requested preferring MP4, try the ?format=mp4 variant for GIF-like paths
+    try:
+        if args and getattr(args, 'prefer_mp4', False):
+            from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+            p = urlparse(url)
+            path = (p.path or "").lower()
+            if path.endswith('.gif'):
+                # build variant with format=mp4 query parameter (preserve existing query except remove conflicting format)
+                q = parse_qs(p.query or "", keep_blank_values=True)
+                q['format'] = ['mp4']
+                new_q = urlencode(q, doseq=True)
+                pref_p = p._replace(query=new_q)
+                prefer_url = urlunparse(pref_p)
+                try:
+                    # lightweight HEAD to check content-type
+                    with requests.head(prefer_url, timeout=8, headers=headers, allow_redirects=True) as hr:
+                        ctype = hr.headers.get('content-type', '').lower()
+                        if 'video/mp4' in ctype:
+                            try:
+                                logging.getLogger(__name__).debug('Prefer MP4 variant: %s -> %s', url, prefer_url)
+                            except Exception:
+                                pass
+                            url = prefer_url
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     import time
     attempts = 3
     backoff = 1.0
@@ -1085,6 +1116,7 @@ def main(argv=None):
     p.add_argument("--postid", "-p", action="append", help="Post ID(s) (comma-separated or repeat flag)")
     p.add_argument("--config", "-c", help="Path to config JSON file")
     p.add_argument("--retry-failed", action="store_true", help="Retry previously failed downloads")
+    p.add_argument("--clear-failed", action="store_true", help="Clear the failed URLs tracking database")
     p.add_argument("--max-posts", type=int, default=None, help="Maximum number of posts to fetch")
     p.add_argument("--all", action="store_true", help="Fetch all posts by following pagination")
     p.add_argument("--per-page", type=int, default=100, help="Number of posts to request per page when paginating (default: 100, max: 100 enforced by Reddit API)")
@@ -1095,11 +1127,14 @@ def main(argv=None):
     p.add_argument("--partial-fingerprint", action="store_true", help="Enable partial-range fingerprinting")
     p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument("--prefer-mp4", action="store_true", help="Prefer MP4 variants (e.g. add ?format=mp4) when available; fall back to original URL if not")
     p.add_argument("--no-save-meta", "--no-json-meta", dest="no_save_meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time). Alias: --no-json-meta")
     p.add_argument("--save-meta-only", dest="save_meta_only", action="store_true", help="Only save per-post metadata JSON files; do not download media files.")
     p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
     p.add_argument("--save-bio", dest="save_bio", action="store_true", help="Fetch user profile bio(s) and save compact JSON into <outdir>/user_bio (for --user)")
     p.add_argument("--only-verified", dest="only_verified", action="store_true", help="When specified with --user, only process users whose profile has `verified: true`")
+    # populate module-level args so other functions can reference parsed flags
+    global args
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     # If user didn't provide a --config and no env credentials are present,
@@ -1616,6 +1651,26 @@ def main(argv=None):
         idx = Md5Index(md5_sql_path)
     except Exception:
         idx = None
+    
+    # Handle --clear-failed option
+    if args.clear_failed and idx:
+        try:
+            if hasattr(idx, 'clear_failed_urls'):
+                count = idx.clear_failed_urls()
+                logging.getLogger(__name__).info("Cleared %d failed URLs from tracking database", count)
+            else:
+                # Fallback to direct SQL for older index instances
+                with idx._lock:
+                    cur = idx._conn.cursor()
+                    cur.execute("DELETE FROM failed_urls")
+                    count = cur.rowcount
+                    idx._conn.commit()
+                logging.getLogger(__name__).info("Cleared %d failed URLs from tracking database", count)
+            return
+        except Exception as e:
+            logging.getLogger(__name__).error("Failed to clear failed URLs: %s", e)
+            return
+    
     # Note: legacy JSON->SQLite migration removed. If you need to import an old
     # `.md5_index.json` file, run a one-time migration tool separately.
 
@@ -2105,6 +2160,109 @@ def main(argv=None):
             except Exception:
                 pass
 
+            # Second pre-scan: check for previously failed URLs (unless --force is used)
+            try:
+                if idx and tasks and not args.force:
+                    remaining = []
+                    for item in tasks:
+                        try:
+                            folder, post_id, u, _meta, ctx_label = item
+                        except Exception:
+                            try:
+                                folder, post_id, u, _meta = item
+                                ctx_label = None
+                            except Exception:
+                                try:
+                                    folder, post_id, u = item
+                                    ctx_label = None
+                                except Exception:
+                                    remaining.append(item)
+                                    continue
+                        try:
+                            norm_u = normalize_media_url(u)
+                            try:
+                                # Debug: log URL being checked
+                                logging.getLogger(__name__).debug("Checking if URL failed: %s -> %s", u, norm_u)
+                                is_failed = idx.is_url_failed(norm_u)
+                                logging.getLogger(__name__).debug("is_url_failed result: %s", is_failed)
+                            except Exception:
+                                pass
+                            if idx.is_url_failed(norm_u):
+                                try:
+                                    logging.getLogger(__name__).debug("URL IS FAILED! Skipping...")
+                                except Exception:
+                                    pass
+                                # Skip previously failed URLs
+                                try:
+                                    stats["media_skipped"] += 1
+                                except Exception:
+                                    pass
+                                try:
+                                    # prefer explicit context label when provided
+                                    if ctx_label:
+                                        host_label = ctx_label
+                                    else:
+                                        from urllib.parse import urlparse
+                                        lh = (urlparse(u).hostname or "").lower()
+                                        host_label = "Unknown"
+                                        if "redgifs" in lh:
+                                            host_label = "Redgifs"
+                                        elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
+                                            host_label = "Redd.it"
+                                        else:
+                                            parts = lh.split('.') if lh else []
+                                            host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
+                                except Exception:
+                                    host_label = "Unknown"
+                                try:
+                                    # prefer showing the per-post filename (post_id + extension) so logs match downloads
+                                    from urllib.parse import urlparse, unquote
+                                    path = urlparse(norm_u).path or ""
+                                    ext = os.path.splitext(unquote(path))[1] or ""
+                                    display_name = _sanitize_filename(post_id) + ext if post_id else os.path.basename(unquote(path) or norm_u)
+                                    logging.getLogger(__name__).info("💀 Skipped [%s] [%s] %s (previously failed)", post_id, host_label, display_name)
+                                except Exception:
+                                    pass
+                                
+                                # Clean up any associated files for previously failed URLs
+                                try:
+                                    if post_id and folder:
+                                        # Clean up metadata JSON file
+                                        json_path = os.path.join(folder, f"{_sanitize_filename(post_id)}.json")
+                                        if os.path.exists(json_path):
+                                            os.remove(json_path)
+                                            try:
+                                                logging.getLogger(__name__).debug("Cleaned up metadata: %s", os.path.basename(json_path))
+                                            except Exception:
+                                                pass
+                                        
+                                        # Clean up .failed files (multiple possible extensions)
+                                        base_failed_path = os.path.join(folder, _sanitize_filename(post_id))
+                                        # Look for files with various extensions + .failed
+                                        for root, dirs, files in os.walk(folder):
+                                            if root != folder:  # Only check the immediate folder
+                                                continue
+                                            for file in files:
+                                                if file.startswith(_sanitize_filename(post_id)) and file.endswith('.failed'):
+                                                    failed_path = os.path.join(root, file)
+                                                    try:
+                                                        os.remove(failed_path)
+                                                        try:
+                                                            logging.getLogger(__name__).debug("Cleaned up failed marker: %s", file)
+                                                        except Exception:
+                                                            pass
+                                                    except Exception:
+                                                        pass
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception:
+                            pass
+                        remaining.append(item)
+                    tasks = remaining
+            except Exception:
+                pass
+
             # use thread pool but respect global rate limiter by each worker calling limiter
             limiter = TokenBucket(rate=rate)
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
@@ -2311,6 +2469,28 @@ def main(argv=None):
                                     except Exception:
                                         pass
                                     downloads_since_save = 0
+                        # Remove from failed list if it was previously failed but now succeeded
+                        if idx:
+                            try:
+                                idx.remove_failed_url(norm_u)
+                            except Exception:
+                                pass
+                    else:
+                        # Download failed, record it in the failure tracking
+                        if idx:
+                            try:
+                                # Try to read the failure reason from the .failed file
+                                reason = "download_failed"
+                                try:
+                                    with open(dst, 'r', encoding='utf-8') as fh:
+                                        lines = fh.readlines()
+                                        if len(lines) > 1:
+                                            reason = lines[1].strip()[:100]  # Limit reason length
+                                except Exception:
+                                    pass
+                                idx.record_failed_url(norm_u, reason)
+                            except Exception:
+                                pass
                     return folder, post_id, u, dst, False, context_label
 
                 futures = {ex.submit(worker_item_with_rate, item): item for item in tasks}
@@ -2336,6 +2516,13 @@ def main(argv=None):
                                 fh.write(f"{url}\n{str(e)}\n")
                         except Exception:
                             pass
+                        # Record failure in index
+                        if idx:
+                            try:
+                                norm_u = normalize_media_url(url)
+                                idx.record_failed_url(norm_u, str(e)[:100])
+                            except Exception:
+                                pass
 
                     # Pretty host label for logs (e.g., Redgifs, Redd.it)
                     try:
@@ -2498,11 +2685,12 @@ def main(argv=None):
         return f"{size:.1f} {units[idx]}"
 
     bytes_h = _human_bytes(stats.get('bytes_downloaded', 0))
+    failed_count = idx.get_failed_urls_count() if idx else 0
     summary = (
         f"Summary:\n  Pages fetched: {stats['pages_fetched']}\n  Posts processed: {stats['posts_processed']}\n"
         f"  Media attempted: {stats['media_attempted']}\n  Media downloaded: {stats['media_downloaded']}\n"
         f"  Media failed: {stats['media_failed']}\n  Media skipped: {stats.get('media_skipped', 0)}\n"
-        f"  Bytes downloaded: {bytes_h}\n  Elapsed time: {elapsed:.1f}s"
+        f"  Failed URLs tracked: {failed_count}\n  Bytes downloaded: {bytes_h}\n  Elapsed time: {elapsed:.1f}s"
     )
     logger.info(summary)
 
