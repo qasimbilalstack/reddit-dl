@@ -27,7 +27,7 @@
 - **Gallery Support** - Automatic expansion and host-specific URL normalization
 - **Flexible Output** - Organized downloads with customizable directory structure
 - **Comprehensive Logging** - Detailed audit trails for all download activities
-- **High performance - Parallel, rate-limited downloads for maximum speed without hammering servers.
+- **High performance** - Parallel, rate-limited downloads for maximum speed without hammering servers.
 
 ## Installation
 
