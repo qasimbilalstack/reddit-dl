@@ -10,3 +10,5 @@ build/
 dist/
 settings.json
 reddit-dl-dev
+OUTPUT_ARGUMENT_FEATURE.md
+test_output_arg.py

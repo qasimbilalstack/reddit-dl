@@ -1133,6 +1133,7 @@ def main(argv=None):
     p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
     p.add_argument("--save-bio", dest="save_bio", action="store_true", help="Fetch user profile bio(s) and save compact JSON into <outdir>/user_bio (for --user)")
     p.add_argument("--only-verified", dest="only_verified", action="store_true", help="When specified with --user, only process users whose profile has `verified: true`")
+    p.add_argument("--output", "-o", dest="output_dir", help="Output directory for downloads (overrides config file setting)")
     # populate module-level args so other functions can reference parsed flags
     global args
     args = p.parse_args(argv)
@@ -1214,7 +1215,8 @@ def main(argv=None):
         pass
     reddit_cfg = cfg.get("extractor", {}).get("reddit", {})
     user_agent = reddit_cfg.get("user_agent", DEFAULT_USER_AGENT)
-    outdir = reddit_cfg.get("output_dir", "downloads")
+    # CLI argument --output takes precedence over config file
+    outdir = args.output_dir if args.output_dir else reddit_cfg.get("output_dir", "downloads")
     token = get_oauth_token(cfg)
 
     # Helper to print formatted console messages before logging is configured

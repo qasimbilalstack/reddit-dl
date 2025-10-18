@@ -202,6 +202,7 @@ Supported URL formats:
 
 | Option | Description |
 |--------|-------------|
+| `--output OUTPUT_DIR`, `-o OUTPUT_DIR` | Output directory for downloads (overrides config file setting) |
 | `--max-posts MAX_POSTS` | Maximum number of posts to fetch |
 | `--all` | Fetch all available posts (follow pagination) |
 | `--per-page N` | Number of posts to request per page when paginating (default: 100, max: 100) |
@@ -242,6 +243,15 @@ Download recent posts from a user:
 reddit-dl --config config.json "https://www.reddit.com/user/SomeUser/"
 # Or using the --user flag:
 reddit-dl --config config.json --user SomeUser
+```
+
+Download to a specific directory:
+```bash
+# Use short form (-o)
+reddit-dl --config config.json --user SomeUser -o /path/to/downloads
+
+# Use long form (--output)
+reddit-dl --config config.json --user SomeUser --output ./my_reddit_content
 ```
 
 Download from a subreddit:
