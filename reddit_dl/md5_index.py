@@ -506,16 +506,25 @@ class Md5Index:
             return None
 
     def dedupe_after_download(self, md5: str, dst: str, norm_url: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-        """After downloading a file at `dst`, check if an existing file for `md5` already exists.
+        """After downloading a file at `dst`, check if this MD5 has been seen before.
 
-        If an existing file exists and differs from `dst`, `dst` will be removed and
+        If this MD5 already exists in the database, `dst` will be removed and
         the function returns (True, existing_path). Otherwise the function records
         `dst` in the index and returns (False, dst).
+        
+        Note: This uses MD5-only deduplication (content-based) - file path existence is not required.
+        This allows dedup to work even after files are deleted or moved.
         """
         try:
-            existing = self.get_existing_path_for_md5(md5)
-            if existing and os.path.abspath(existing) != os.path.abspath(dst):
-                # remove duplicate
+            # Check if this MD5 has been seen before (content-based dedup)
+            with self._lock:
+                cur = self._conn.execute("SELECT path FROM md5_to_paths WHERE md5 = ? LIMIT 1", (md5,))
+                row = cur.fetchone()
+                existing = row[0] if row else None
+            
+            # If MD5 was seen before, delete the newly downloaded file (it's a duplicate)
+            if existing:
+                # remove duplicate file
                 try:
                     os.remove(dst)
                 except Exception:
@@ -527,7 +536,8 @@ class Md5Index:
                 except Exception:
                     pass
                 return True, existing
-            # No existing duplicate found: record dst
+            
+            # MD5 not seen before: record this new file
             try:
                 if norm_url:
                     self.set_url_md5(norm_url, md5)

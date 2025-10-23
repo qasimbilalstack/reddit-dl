@@ -20,3 +20,6 @@ MD5_ONLY_DEDUP.md
 MD5_QUICK_REF.md
 MD5_VERIFICATION_REPORT.md
 TEST_REPORT.md
+reddit_dl/md5_index.py
+reddit-dl-run.log
+reddit-dl-run-2.log
