@@ -188,7 +188,7 @@ Supported URL formats:
 |--------|-------------|
 | `-h, --help` | Show help message and exit |
 | `-c, --config CONFIG` | Path to configuration JSON file |
-| `--debug` | Enable debug logging output |
+| `--debug` | Enable debug logging output (also bypasses MD5 deduplication to see all downloads) |
 
 #### Source Selection
 
@@ -222,7 +222,7 @@ Supported URL formats:
 
 | Option | Description |
 |--------|-------------|
-| `--no-save-meta`, `--no-json-meta` | Do not write per-post metadata JSON files (saves disk and time) |
+| `--save-json` | Save per-post metadata JSON files (disabled by default for faster downloads) |
 | `--save-meta-only` | Only save per-post metadata JSON files; do not download media files |
 | `--comments` | Fetch comments in addition to submissions (disabled by default). Without this flag only submissions are fetched (uses /submitted/ URLs) |
 
@@ -324,8 +324,8 @@ Download with custom sort order and pagination:
 reddit-dl --config config.json --sort top --per-page 50 \
   "https://www.reddit.com/r/earthporn/"
 
-# Download hot posts without metadata JSON files
-reddit-dl --config config.json --sort hot --no-save-meta \
+# Download hot posts without metadata JSON files (faster)
+reddit-dl --config config.json --sort hot \
   "https://www.reddit.com/user/SomeUser/"
 
 # Download only submissions (comments disabled by default) from multiple users
@@ -430,14 +430,32 @@ The MD5 index is stored at `downloads/.md5_index.sqlite` by default. This file:
 - Can be safely deleted to reset deduplication tracking
 - Is automatically checkpointed based on `--save-interval` setting
 
-### Force Option Behavior
+### Force and Debug Options
 
-**Important:** The `--force` flag **only** bypasses the failed URL check. MD5 deduplication **always runs** and cannot be disabled. This ensures:
-- You never store duplicate content, even with `--force`
-- Previously failed downloads can be retried
+**`--force` Flag:**
+- Bypasses the failed URL check (retries previously failed downloads)
+- MD5 deduplication still runs normally
+- Useful for recovering from incomplete downloads
+
+**`--debug` Flag:**
+- Enables verbose logging output
+- **Also bypasses MD5 deduplication** (keeps all files even if duplicates)
+- Useful for testing, debugging, and verifying content differences
+- Files are downloaded and kept on disk without duplicate deletion
+- MD5 hashes are still recorded in database for future runs
+
+**Important:** In normal operation (without `--debug`), MD5 deduplication **always runs** to ensure:
+- You never store duplicate content
 - Storage remains efficient
+- Only unique files are kept
 
 ## Troubleshooting
+
+### Common Issues
+
+#### Command Not Found
+```bash
+````## Troubleshooting
 
 ### Common Issues
 
@@ -476,7 +494,7 @@ Downloads are slow or timing out
 ```
 **Solutions:**
 - Reduce `--max-posts` for testing
-- Try `--no-save-meta` to reduce disk I/O
+- Omit `--save-json` to skip metadata writing (faster)
 - Use `--per-page` with smaller values (e.g., 25) for better rate limiting
 - Check network connectivity
 - Monitor Reddit API rate limits

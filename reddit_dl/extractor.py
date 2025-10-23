@@ -184,141 +184,7 @@ def normalize_media_url(url: str) -> str:
         return url
 
 
-def load_md5_db(path: str) -> Dict:
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-                # normalize url keys to avoid token/query churn
-                raw_map = raw.get("url_to_md5", {}) if isinstance(raw, dict) else {}
-                raw_paths = raw.get("md5_to_paths", {}) if isinstance(raw, dict) else {}
-                new_map: Dict[str, str] = {}
-                new_paths: Dict[str, list] = {}
-                for url, md5 in list(raw_map.items()):
-                    try:
-                        norm = normalize_media_url(url)
-                    except Exception:
-                        norm = url
-                    # prefer the first md5 seen for a normalized URL
-                    if norm in new_map:
-                        # if md5 differs, still merge path lists under both md5 entries
-                        if new_map[norm] != md5:
-                            # add paths for this md5 if present
-                            for p in raw_paths.get(md5, []):
-                                new_paths.setdefault(md5, []).append(p)
-                        continue
-                    new_map[norm] = md5
-                    # dedupe paths for this md5
-                    seen = set()
-                    for p in raw_paths.get(md5, []):
-                        if p in seen:
-                            continue
-                        seen.add(p)
-                        new_paths.setdefault(md5, []).append(p)
-                # preserve any existing etag_to_md5 mappings
-                raw_etags = raw.get("etag_to_md5", {}) if isinstance(raw, dict) else {}
-                migrated = {"url_to_md5": new_map, "md5_to_paths": new_paths, "etag_to_md5": raw_etags}
-                # save migrated DB back to path for future runs
-                try:
-                    save_md5_db(migrated, path)
-                except Exception:
-                    pass
-                return migrated
-    except Exception:
-        pass
-    # structure: {"url_to_md5": {url: md5}, "md5_to_paths": {md5: [paths]}}
-    return {"url_to_md5": {}, "md5_to_paths": {}}
 
-
-def migrate_and_normalize_md5_db(path: str) -> None:
-    """Read existing md5 db, normalize all URL keys and save back. Safe to call repeatedly."""
-    try:
-        if not os.path.exists(path):
-            return
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-        raw_map = raw.get("url_to_md5", {}) if isinstance(raw, dict) else {}
-        raw_paths = raw.get("md5_to_paths", {}) if isinstance(raw, dict) else {}
-        new_map: Dict[str, str] = {}
-        new_paths: Dict[str, list] = {}
-        for url, md5 in list(raw_map.items()):
-            try:
-                norm = normalize_media_url(url)
-            except Exception:
-                norm = url
-            # if collision (different md5 for same normalized URL) just keep first md5 and merge paths
-            if norm in new_map and new_map[norm] != md5:
-                # merge paths for this md5
-                for p in raw_paths.get(md5, []):
-                    new_paths.setdefault(md5, []).append(p)
-                continue
-            new_map[norm] = md5
-            # dedupe paths
-            seen = set()
-            for p in raw_paths.get(md5, []):
-                if p in seen:
-                    continue
-                seen.add(p)
-                new_paths.setdefault(md5, []).append(p)
-
-        # preserve any existing etag_to_md5 mappings
-        raw_etags = raw.get("etag_to_md5", {}) if isinstance(raw, dict) else {}
-        migrated = {"url_to_md5": new_map, "md5_to_paths": new_paths, "etag_to_md5": raw_etags}
-        save_md5_db(migrated, path)
-    except Exception:
-        pass
-
-
-def save_md5_db(db: Dict, path: str) -> None:
-    try:
-        d = os.path.dirname(path)
-        if d and not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
-        # Ensure url keys are normalized before persisting to disk
-        out = dict(db)
-        try:
-            raw_map = out.get("url_to_md5", {}) if isinstance(out, dict) else {}
-            new_map: Dict[str, str] = {}
-            for url, md5 in list(raw_map.items()):
-                try:
-                    norm = normalize_media_url(url)
-                except Exception:
-                    norm = url
-                # prefer the first md5 seen for a normalized URL
-                if norm in new_map:
-                    continue
-                new_map[norm] = md5
-            out["url_to_md5"] = new_map
-            # also dedupe md5_to_paths lists before writing
-            try:
-                raw_paths = out.get("md5_to_paths", {}) if isinstance(out, dict) else {}
-                new_paths = {}
-                for md5, paths in raw_paths.items():
-                    seen = set()
-                    lst = []
-                    for p in paths:
-                        if p in seen:
-                            continue
-                        seen.add(p)
-                        lst.append(p)
-                    if lst:
-                        new_paths[md5] = lst
-                out["md5_to_paths"] = new_paths
-            except Exception:
-                pass
-        except Exception:
-            # fall back to writing original db on error
-            out = db
-        # include etag_to_md5 if present
-        try:
-            if isinstance(db, dict) and "etag_to_md5" in db:
-                out["etag_to_md5"] = db.get("etag_to_md5", {})
-        except Exception:
-            pass
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(out, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
 
 
 def compute_md5(path: str, chunk_size: int = 8192) -> Optional[str]:
@@ -971,7 +837,8 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
                 prefer_url = urlunparse(pref_p)
                 try:
                     # lightweight HEAD to check content-type
-                    with requests.head(prefer_url, timeout=8, headers=headers, allow_redirects=True) as hr:
+                    hr = requests.head(prefer_url, timeout=8, headers=headers, allow_redirects=True)
+                    if hr.status_code == 200:
                         ctype = hr.headers.get('content-type', '').lower()
                         if 'video/mp4' in ctype:
                             try:
@@ -979,8 +846,26 @@ def download_url(url: str, outdir: str, token: Optional[str] = None, user_agent:
                             except Exception:
                                 pass
                             url = prefer_url
-                except Exception:
-                    pass
+                        else:
+                            try:
+                                logging.getLogger(__name__).debug('MP4 variant not available (content-type=%s), falling back to GIF', ctype)
+                            except Exception:
+                                pass
+                    elif hr.status_code == 403:
+                        try:
+                            logging.getLogger(__name__).debug('MP4 variant rejected by CDN (403 Forbidden), falling back to GIF')
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            logging.getLogger(__name__).debug('MP4 variant returned %d, falling back to GIF', hr.status_code)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    try:
+                        logging.getLogger(__name__).debug('Error checking MP4 variant: %s, falling back to GIF', e)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -1125,7 +1010,7 @@ def main(argv=None):
     p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N updates (default: 10)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     p.add_argument("--prefer-mp4", action="store_true", help="Prefer MP4 variants (e.g. add ?format=mp4) when available; fall back to original URL if not")
-    p.add_argument("--no-save-meta", "--no-json-meta", dest="no_save_meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time). Alias: --no-json-meta")
+    p.add_argument("--save-json", dest="save_json", action="store_true", help="Save per-post metadata JSON files (disabled by default for faster downloads)")
     p.add_argument("--save-meta-only", dest="save_meta_only", action="store_true", help="Only save per-post metadata JSON files; do not download media files.")
     p.add_argument("--comments", dest="comments", action="store_true", help="Fetch comments in addition to submissions (default: off). Use to fetch comment threads; without this flag only submissions are fetched.")
     p.add_argument("--save-bio", dest="save_bio", action="store_true", help="Fetch user profile bio(s) and save compact JSON into <outdir>/user_bio (for --user)")
@@ -2046,8 +1931,8 @@ def main(argv=None):
                 looks_like_submission = bool(media_urls)
 
             meta_path = None
-            # Respect --no-save-meta: avoid writing per-post metadata JSON when requested
-            if looks_like_submission and not getattr(args, "no_save_meta", False):
+            # Save JSON only if --save-json flag is explicitly provided
+            if looks_like_submission and getattr(args, "save_json", False):
                 meta_path = os.path.join(source_dir, f"{_sanitize_filename(post_id)}.json")
                 try:
                     with open(meta_path, "w", encoding="utf-8") as fh:
@@ -2223,37 +2108,44 @@ def main(argv=None):
                     # if download succeeded, compute md5 and check for duplicates
                     if not dst.endswith('.failed'):
                         md5 = compute_md5(dst)
+                        # Skip MD5 deduplication in debug mode (for testing/debugging purposes)
+                        # Files are still kept even if they're duplicates when using --debug
+                        skip_dedup = getattr(args, 'debug', False)
                         if md5 and idx:
-                            # Check if this MD5 has been seen before
-                            try:
-                                is_duplicate = idx.dedupe_after_download(md5, dst)
-                            except Exception:
-                                is_duplicate = False
-                            
-                            if is_duplicate:
-                                # File was a duplicate and has been deleted
+                            if not skip_dedup:
+                                # Normal mode: Check if this MD5 has been seen before
                                 try:
-                                    stats["media_skipped"] += 1
+                                    is_duplicate = idx.dedupe_after_download(md5, dst)
                                 except Exception:
+                                    is_duplicate = False
+                                
+                                if is_duplicate:
+                                    # File was a duplicate and has been deleted
+                                    # Note: Logging is handled in post-processing to avoid duplicate log messages
                                     pass
-                                try:
-                                    if getattr(args, 'debug', False):
-                                        host_label = context_label or 'Unknown'
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (duplicate MD5=%s)", post_id, host_label, os.path.basename(dst), md5[:8])
-                                    else:
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] %s (duplicate)", post_id, os.path.basename(dst))
-                                except Exception:
-                                    pass
+                                else:
+                                    # New file, MD5 has been recorded
+                                    # Periodic checkpoint
+                                    downloads_since_save += 1
+                                    if downloads_since_save >= save_interval:
+                                        try:
+                                            idx.checkpoint()
+                                        except Exception:
+                                            pass
+                                        downloads_since_save = 0
                             else:
-                                # New file, MD5 has been recorded
-                                # Periodic checkpoint
-                                downloads_since_save += 1
-                                if downloads_since_save >= save_interval:
-                                    try:
-                                        idx.checkpoint()
-                                    except Exception:
-                                        pass
-                                    downloads_since_save = 0
+                                # Debug mode: Record MD5 but keep the file (don't delete duplicates)
+                                try:
+                                    idx.add_md5(md5)
+                                    downloads_since_save += 1
+                                    if downloads_since_save >= save_interval:
+                                        try:
+                                            idx.checkpoint()
+                                        except Exception:
+                                            pass
+                                        downloads_since_save = 0
+                                except Exception:
+                                    pass
                         # Remove from failed list if it was previously failed but now succeeded
                         if idx:
                             try:
