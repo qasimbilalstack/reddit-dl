@@ -1122,10 +1122,7 @@ def main(argv=None):
     p.add_argument("--per-page", type=int, default=100, help="Number of posts to request per page when paginating (default: 100, max: 100 enforced by Reddit API)")
     p.add_argument("--force", action="store_true", help="Force re-download even if file exists")
     p.add_argument("--sort", choices=["hot", "new", "top", "rising", "best"], default="new", help="Listing sort order to request from Reddit (default: new)")
-    p.add_argument("--no-head-check", dest="head_check", action="store_false", help="Disable HEAD-based checks")
     p.add_argument("--save-interval", type=int, default=10, help="Persist md5 DB every N updates (default: 10)")
-    p.add_argument("--partial-fingerprint", action="store_true", help="Enable partial-range fingerprinting")
-    p.add_argument("--partial-size", type=int, default=65536, help="Bytes for partial fingerprint (default: 65536)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     p.add_argument("--prefer-mp4", action="store_true", help="Prefer MP4 variants (e.g. add ?format=mp4) when available; fall back to original URL if not")
     p.add_argument("--no-save-meta", "--no-json-meta", dest="no_save_meta", action="store_true", help="Do not write per-post metadata JSON files (saves disk and time). Alias: --no-json-meta")
@@ -1698,10 +1695,6 @@ def main(argv=None):
     cfg_md5 = cfg_reddit.get("md5_save_interval")
     cfg_legacy = cfg_reddit.get("save_interval")
     save_interval = _parse_positive_int(getattr(args, "save_interval", None) or env_md5 or env_legacy or cfg_md5 or cfg_legacy, 10)
-    partial_enabled = bool(args.partial_fingerprint)
-    partial_size = int(args.partial_size or 65536)
-    # cache for partial fingerprints of local files for this run: md5 -> fingerprint
-    _partial_cache: Dict[str, str] = {}
     # If user asked to retry existing .failed files, process them first
     if args.retry_failed:
         # ensure outdir exists and scan for .failed files
@@ -2100,69 +2093,8 @@ def main(argv=None):
                 # When only saving metadata, do not schedule downloads for this source.
                 # No profile checks are required here.
                 continue
-            # Compact pre-scan: check index and skip scheduling for known MD5s (best-effort, no file copies)
-            try:
-                if idx and tasks:
-                    remaining = []
-                    for item in tasks:
-                        try:
-                            folder, post_id, u, _meta, ctx_label = item
-                        except Exception:
-                            try:
-                                folder, post_id, u, _meta = item
-                                ctx_label = None
-                            except Exception:
-                                try:
-                                    folder, post_id, u = item
-                                    ctx_label = None
-                                except Exception:
-                                    remaining.append(item)
-                                    continue
-                        try:
-                            norm_u = normalize_media_url(u)
-                            md5, existing_path = idx.lookup_by_normalized_url(norm_u)
-                        except Exception:
-                            remaining.append(item)
-                            continue
-                        if not md5 or not existing_path:
-                            remaining.append(item)
-                            continue
-                        # mark skipped immediately and log (no network/file ops)
-                        try:
-                            stats["media_skipped"] += 1
-                        except Exception:
-                            pass
-                        try:
-                            # prefer explicit context label when provided
-                            if ctx_label:
-                                host_label = ctx_label
-                            else:
-                                from urllib.parse import urlparse
-                                lh = (urlparse(u).hostname or "").lower()
-                                host_label = "Unknown"
-                                if "redgifs" in lh:
-                                    host_label = "Redgifs"
-                                elif "reddit" in lh or lh.endswith("redd.it") or "redd.it" in lh:
-                                    host_label = "Redd.it"
-                                else:
-                                    parts = lh.split('.') if lh else []
-                                    host_label = parts[-2].capitalize() if len(parts) >= 2 else (lh or "Unknown").capitalize()
-                        except Exception:
-                            host_label = "Unknown"
-                        try:
-                            # prefer showing the per-post filename (post_id + extension) so logs match downloads
-                            from urllib.parse import urlparse, unquote
-                            path = urlparse(norm_u).path or ""
-                            ext = os.path.splitext(unquote(path))[1] or ""
-                            display_name = _sanitize_filename(post_id) + ext if post_id else os.path.basename(unquote(path) or norm_u)
-                            logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s", post_id, host_label, display_name)
-                        except Exception:
-                            pass
-                    tasks = remaining
-            except Exception:
-                pass
-
-            # Second pre-scan: check for previously failed URLs (unless --force is used)
+            
+            # Pre-scan: check for previously failed URLs (unless --force is used)
             try:
                 if idx and tasks and not args.force:
                     remaining = []
@@ -2281,152 +2213,25 @@ def main(argv=None):
                             folder, post_id, u = item
                             meta_path = None
                             context_label = None
-                    def _skipped_return(dest):
-                        # when a media is skipped because it already exists, preserve the per-post JSON
-                        # (previous behavior removed metadata; keep it to avoid surprise data loss)
-                        return folder, post_id, u, dest, True, context_label
+                    
                     nonlocal downloads_since_save
                     limiter.wait_for_token()
-                    if args.force:
-                        # bypass MD5/index skipping
-                        dst = download_url(u, folder, token=token, user_agent=user_agent, filename=post_id)
-                        if not dst.endswith('.failed'):
-                            md5 = compute_md5(dst)
-                            if md5 and idx:
-                                norm_u = normalize_media_url(u)
-                                try:
-                                    idx.set_url_md5(norm_u, md5)
-                                    idx.add_path_for_md5(md5, dst)
-                                except Exception:
-                                    pass
-                        return folder, post_id, u, dst, False, context_label
-                    # quick URL-based skip: if we've seen this URL before and it maps to an md5,
-                    # and the md5 already exists in our index, skip downloading
                     norm_u = normalize_media_url(u)
-                    try:
-                        md5, existing_path = idx.lookup_by_normalized_url(norm_u) if idx else (None, None)
-                    except Exception:
-                        md5, existing_path = (None, None)
-
-                    if md5 and existing_path:
-                        # copy existing into per-post folder if possible
-                        try:
-                            target_path = idx.copy_existing_to_folder(md5, folder, post_id)
-                            if target_path:
-                                try:
-                                    stats["recovered"] += 1
-                                except Exception:
-                                    pass
-                                return _skipped_return(target_path)
-                            else:
-                                return _skipped_return(existing_path)
-                        except Exception:
-                            return _skipped_return(existing_path)
-
-                    cl = None
-                    etag = None
-                    # perform optional HEAD-based checks
-                    if args.head_check:
-                        try:
-                            cl, etag = head_check(u, user_agent)
-                        except Exception:
-                            cl = None
-                            etag = None
-
-                    # If we have an ETag from HEAD, check if we've seen it before
-                    if etag:
-                        try:
-                            mapped_md5, mapped_path = idx.find_by_etag(etag) if idx else (None, None)
-                        except Exception:
-                            mapped_md5, mapped_path = (None, None)
-                        if mapped_md5 and mapped_path:
-                            try:
-                                # prefer to copy existing into per-post folder
-                                target_path = idx.copy_existing_to_folder(mapped_md5, folder, post_id)
-                                if target_path:
-                                    try:
-                                        stats["recovered"] += 1
-                                    except Exception:
-                                        pass
-                                    return _skipped_return(target_path)
-                                else:
-                                    return _skipped_return(mapped_path)
-                            except Exception:
-                                return _skipped_return(mapped_path)
-                        try:
-                            if idx and mapped_md5:
-                                idx.set_url_md5(norm_u, mapped_md5)
-                        except Exception:
-                            pass
-                        if mapped_md5:
-                            return _skipped_return(folder)
-                    # If we don't have a URL or ETag match, and we have a Content-Length, try size-based match
-                    if args.head_check and cl:
-                        try:
-                            md5_by_size, path_by_size = idx.find_by_size(cl) if idx else (None, None)
-                            if md5_by_size and path_by_size:
-                                try:
-                                    idx.set_url_md5(norm_u, md5_by_size)
-                                except Exception:
-                                    pass
-                                if etag:
-                                    try:
-                                        idx.set_etag_md5(etag, md5_by_size)
-                                    except Exception:
-                                        pass
-                                return folder, post_id, u, path_by_size, True, context_label
-                        except Exception:
-                            pass
-
-                    # Optional partial-range fingerprinting: fetch first N bytes and compare to local partials
-                    if partial_enabled:
-                        try:
-                            remote_fp = None
-                            try:
-                                remote_fp = None
-                                chunk = None
-                                from hashlib import sha256
-                                # attempt a ranged GET for the first partial_size bytes
-                                headers = {"User-Agent": user_agent, "Range": f"bytes=0-{partial_size - 1}"}
-                                r = requests.get(u, headers=headers, stream=True, timeout=20, allow_redirects=True)
-                                if r.status_code in (200, 206):
-                                    # read up to partial_size bytes
-                                    data = b""
-                                    for part in r.iter_content(chunk_size=8192):
-                                        if not part:
-                                            break
-                                        data += part
-                                        if len(data) >= partial_size:
-                                            break
-                                    if data:
-                                        remote_fp = sha256(data[:partial_size]).hexdigest()
-                            except Exception:
-                                remote_fp = None
-                            if remote_fp:
-                                try:
-                                    mapped_md5, mapped_path = idx.find_by_partial_fp(remote_fp, _partial_cache, partial_size) if idx else (None, None)
-                                    if mapped_md5 and mapped_path:
-                                        try:
-                                            idx.set_url_md5(norm_u, mapped_md5)
-                                        except Exception:
-                                            pass
-                                        return _skipped_return(mapped_path)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
+                    
+                    # Download the file
                     dst = download_url(u, folder, token=token, user_agent=user_agent, filename=post_id)
-                    # if download succeeded, compute md5 and update db
+                    # if download succeeded, compute md5 and check for duplicates
                     if not dst.endswith('.failed'):
                         md5 = compute_md5(dst)
                         if md5 and idx:
-                            # Delegate post-download dedupe/recording to Md5Index methods
+                            # Check if this MD5 has been seen before
                             try:
-                                is_dup, existing = idx.dedupe_after_download(md5, dst, norm_u)
+                                is_duplicate = idx.dedupe_after_download(md5, dst)
                             except Exception:
-                                is_dup, existing = (False, None)
-                            if is_dup:
+                                is_duplicate = False
+                            
+                            if is_duplicate:
+                                # File was a duplicate and has been deleted
                                 try:
                                     stats["media_skipped"] += 1
                                 except Exception:
@@ -2434,36 +2239,14 @@ def main(argv=None):
                                 try:
                                     if getattr(args, 'debug', False):
                                         host_label = context_label or 'Unknown'
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (md5=%s)", post_id, host_label, os.path.basename(dst), md5)
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] [%s] %s (duplicate MD5=%s)", post_id, host_label, os.path.basename(dst), md5[:8])
                                     else:
-                                        logging.getLogger(__name__).info("🛑 Skipped [%s] %s", post_id, os.path.basename(dst))
+                                        logging.getLogger(__name__).info("🛑 Skipped [%s] %s (duplicate)", post_id, os.path.basename(dst))
                                 except Exception:
                                     pass
                             else:
-                                try:
-                                    # record ETag if available
-                                    _, resp_etag = head_check(u, user_agent)
-                                    if resp_etag:
-                                        try:
-                                            idx.set_etag_md5(resp_etag, md5)
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-                                try:
-                                    if partial_enabled:
-                                        from hashlib import sha256
-                                        with open(dst, 'rb') as _fh:
-                                            data = _fh.read(partial_size)
-                                            if data:
-                                                fp = sha256(data).hexdigest()
-                                                try:
-                                                    idx.set_fp_md5(fp, md5)
-                                                except Exception:
-                                                    pass
-                                except Exception:
-                                    pass
-                                # periodic checkpoint (optional)
+                                # New file, MD5 has been recorded
+                                # Periodic checkpoint
                                 downloads_since_save += 1
                                 if downloads_since_save >= save_interval:
                                     try:
@@ -2481,16 +2264,7 @@ def main(argv=None):
                         # Download failed, record it in the failure tracking
                         if idx:
                             try:
-                                # Try to read the failure reason from the .failed file
-                                reason = "download_failed"
-                                try:
-                                    with open(dst, 'r', encoding='utf-8') as fh:
-                                        lines = fh.readlines()
-                                        if len(lines) > 1:
-                                            reason = lines[1].strip()[:100]  # Limit reason length
-                                except Exception:
-                                    pass
-                                idx.record_failed_url(norm_u, reason)
+                                idx.add_failed_url(norm_u)
                             except Exception:
                                 pass
                     return folder, post_id, u, dst, False, context_label
@@ -2522,7 +2296,7 @@ def main(argv=None):
                         if idx:
                             try:
                                 norm_u = normalize_media_url(url)
-                                idx.record_failed_url(norm_u, str(e)[:100])
+                                idx.add_failed_url(norm_u)
                             except Exception:
                                 pass
 
@@ -2688,9 +2462,11 @@ def main(argv=None):
 
     bytes_h = _human_bytes(stats.get('bytes_downloaded', 0))
     failed_count = idx.get_failed_urls_count() if idx else 0
+    # Calculate actual media downloaded: attempted - skipped - failed
+    actual_downloaded = stats['media_attempted'] - stats.get('media_skipped', 0) - stats['media_failed']
     summary = (
         f"Summary:\n  Pages fetched: {stats['pages_fetched']}\n  Posts processed: {stats['posts_processed']}\n"
-        f"  Media attempted: {stats['media_attempted']}\n  Media downloaded: {stats['media_downloaded']}\n"
+        f"  Media attempted: {stats['media_attempted']}\n  Media downloaded: {actual_downloaded}\n"
         f"  Media failed: {stats['media_failed']}\n  Media skipped: {stats.get('media_skipped', 0)}\n"
         f"  Failed URLs tracked: {failed_count}\n  Bytes downloaded: {bytes_h}\n  Elapsed time: {elapsed:.1f}s"
     )

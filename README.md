@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://python.org)
 [![Version](https://img.shields.io/badge/version-0.1-green.svg)](setup.py)
 
- focused fork of gallery-dl — that uses OAuth2 for secure API access, smart SQLite-backed deduplication to avoid re-downloading, and robust extraction across users, subreddits, and individual posts. It’s built for speed (concurrent workers + polite rate-limiting) and bandwidth efficiency (HEAD/ETag and partial-range checks), while keeping logs and output organized so your downloads stay easy to manage.
+ focused fork of gallery-dl — that uses OAuth2 for secure API access, and MD5-based content deduplication to avoid re-downloading. It automatically detects and removes duplicate media files based on content (MD5 hash), ensuring you only store unique files. Built for speed (concurrent workers + polite rate-limiting) and efficiency, while keeping logs and output organized.
 
 ## Table of Contents
 
@@ -22,12 +22,12 @@
 ## Features
 
 - **OAuth2 Authentication** - Secure Reddit API access using script app credentials
-- **Smart Deduplication** - Persistent SQLite-based index prevents duplicate downloads
-- **Optimized Downloads** - HEAD/ETag/partial-range checks minimize bandwidth usage
+- **MD5-Based Deduplication** - Automatically detects and deletes duplicate files by content hash
+- **Simple & Reliable** - Persistent SQLite database tracks seen content across all runs
 - **Gallery Support** - Automatic expansion and host-specific URL normalization
 - **Flexible Output** - Organized downloads with customizable directory structure
 - **Comprehensive Logging** - Detailed audit trails for all download activities
-- **High performance** - Parallel, rate-limited downloads for maximum speed without hammering servers.
+- **High Performance** - Parallel, rate-limited downloads for maximum speed
 
 ## Installation
 
@@ -128,7 +128,7 @@ Files will be saved to `downloads/` with organized subfolders and detailed logs 
 | `token_cache` | Path to OAuth token cache file | `~/.reddit_dl_tokens.json` |
 | `max_posts` | Default maximum posts per source | Unlimited |
 | `default_max_posts` | Default max posts when no --max-posts or --all | 1000 |
-| `md5_save_interval` | MD5/index checkpoint frequency (downloads between saves) | 10 |
+| `md5_save_interval` | MD5 database checkpoint frequency (saves after N downloads) | 10 |
 | `parallel_downloads` | Number of parallel downloads | 4 |
 | `requests_per_second` | Rate limit for download requests (per second) | 4.0 |
 
@@ -207,17 +207,16 @@ Supported URL formats:
 | `--all` | Fetch all available posts (follow pagination) |
 | `--per-page N` | Number of posts to request per page when paginating (default: 100, max: 100) |
 | `--sort {hot,new,top,rising,best}` | Listing sort order to request from Reddit (default: new) |
-| `--force` | Force re-download existing files |
+| `--force` | Retry previously failed downloads (Note: MD5 deduplication always runs) |
 | `--retry-failed` | Retry previously failed downloads |
+| `--clear-failed` | Clear the failed URLs tracking database |
+| `--prefer-mp4` | Prefer MP4 video format when available (adds ?format=mp4 to compatible URLs) |
 
 #### Performance Options
 
 | Option | Description |
 |--------|-------------|
-| `--no-head-check` | Disable HEAD request optimization |
-| `--partial-fingerprint` | Enable partial content fingerprinting |
-| `--partial-size BYTES` | Bytes to fetch for fingerprinting (default: 65536) |
-| `--save-interval N` | Save MD5 database every N updates (default: 10) |
+| `--save-interval N` | Save MD5 database every N downloads (default: 10) |
 
 #### Content Control
 
@@ -308,9 +307,9 @@ reddit-dl --config config.json --max-posts 50 --debug \
 reddit-dl --config config.json --max-posts 50 --debug --user SomeUser
 ```
 
-Force re-download with custom fingerprinting:
+Force re-download with custom save interval:
 ```bash
-reddit-dl --config config.json --force --partial-fingerprint \
+reddit-dl --config config.json --force --save-interval 1 \
   "https://www.reddit.com/user/SomeUser/"
 ```
 
@@ -372,6 +371,7 @@ reddit-dl --config config.json \
 Downloaded files are organized as follows:
 ```
 downloads/
+├── .md5_index.sqlite        # MD5 deduplication database
 ├── logs.txt                 # Comprehensive download logs
 ├── u_USERNAME/              # User downloads
 │   ├── POST_ID.jpg         # Media files
@@ -382,6 +382,60 @@ downloads/
     ├── POST_ID.json
     └── ...
 ```
+
+## How MD5 Deduplication Works
+
+reddit-dl uses **content-based deduplication** to ensure you never store duplicate media files:
+
+### Process Flow
+
+1. **Download** - File is downloaded to disk
+2. **Calculate MD5** - Content hash is computed for the file
+3. **Check Database** - MD5 is looked up in `.md5_index.sqlite`
+4. **Decision**:
+   - **If MD5 exists** → File is **deleted immediately** (duplicate detected)
+   - **If MD5 is new** → File is **kept**, MD5 added to database
+
+### Key Features
+
+✅ **Content-Based** - Detects duplicates even if filenames differ  
+✅ **Persistent** - Database survives across all runs  
+✅ **Automatic** - No configuration needed, always active  
+✅ **Efficient** - Only unique content stored on disk  
+✅ **Cross-Post Detection** - Same image posted to multiple subreddits = stored once
+
+### Example Behavior
+
+**First Run:**
+```bash
+reddit-dl --config config.json --all --user SomeUser
+# Result: 102 items → 30 unique files kept, 72 duplicates deleted
+# Files on disk: 30 (all unique)
+# Database: 30 MD5 hashes
+```
+
+**Second Run (Same Command):**
+```bash
+reddit-dl --config config.json --all --user SomeUser
+# Result: 102 items downloaded, all detected as duplicates, all deleted
+# Files on disk: 30 (unchanged)
+# Note: Files are downloaded then immediately deleted if duplicate
+```
+
+### Database Location
+
+The MD5 index is stored at `downloads/.md5_index.sqlite` by default. This file:
+- Tracks all MD5 hashes of downloaded content
+- Persists across runs and system restarts
+- Can be safely deleted to reset deduplication tracking
+- Is automatically checkpointed based on `--save-interval` setting
+
+### Force Option Behavior
+
+**Important:** The `--force` flag **only** bypasses the failed URL check. MD5 deduplication **always runs** and cannot be disabled. This ensures:
+- You never store duplicate content, even with `--force`
+- Previously failed downloads can be retried
+- Storage remains efficient
 
 ## Troubleshooting
 
@@ -413,7 +467,6 @@ Files appear to re-download unnecessarily
 ```
 **Solutions:**
 - Check `downloads/logs.txt` for detailed information
-- Try `--no-head-check` to disable optimization
 - Verify MD5 database integrity
 - Use `--debug` for verbose output
 
@@ -423,7 +476,6 @@ Downloads are slow or timing out
 ```
 **Solutions:**
 - Reduce `--max-posts` for testing
-- Enable `--partial-fingerprint` for better deduplication
 - Try `--no-save-meta` to reduce disk I/O
 - Use `--per-page` with smaller values (e.g., 25) for better rate limiting
 - Check network connectivity
