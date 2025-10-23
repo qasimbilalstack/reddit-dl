@@ -235,6 +235,19 @@ class Md5Index:
             cur = self._conn.execute("SELECT path FROM md5_to_paths WHERE md5 = ?", (md5,))
             return [row[0] for row in cur.fetchall()]
 
+    def has_md5_been_seen(self, md5: str) -> bool:
+        """Check if an MD5 hash has been seen/downloaded before.
+        
+        Returns True if the MD5 exists in the database (regardless of whether
+        the associated file still exists on disk).
+        """
+        try:
+            with self._lock:
+                cur = self._conn.execute("SELECT 1 FROM md5_to_paths WHERE md5 = ? LIMIT 1", (md5,))
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
     def add_path_for_md5(self, md5: str, path: str) -> None:
         with self._lock:
             try:
@@ -376,6 +389,23 @@ class Md5Index:
         except Exception:
             pass
         return None, None
+
+    def lookup_by_normalized_url_md5_only(self, norm_url: str) -> Tuple[Optional[str], bool]:
+        """Return (md5, was_seen_before) for a normalized URL.
+        
+        Unlike lookup_by_normalized_url, this checks ONLY if the MD5 has been seen before,
+        without requiring the file to still exist. This allows deduplication based on content
+        even if the original file has been moved or deleted.
+        
+        Returns (md5, True) if URL was previously downloaded, (None, False) if not.
+        """
+        try:
+            md5 = self.get_md5_for_url(norm_url)
+            if md5:
+                return md5, True
+        except Exception:
+            pass
+        return None, False
 
     def find_by_etag(self, etag: str) -> Tuple[Optional[str], Optional[str]]:
         """Return (md5, existing_path) for a given ETag if present and file exists."""
