@@ -200,6 +200,7 @@ class Md5Index:
         # allow callers to checkpoint WAL if they want; best-effort
         try:
             with self._lock:
+                self._conn.commit()
                 self._conn.execute("PRAGMA wal_checkpoint(FULL);")
         except Exception:
             pass
