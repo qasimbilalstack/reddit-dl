@@ -85,6 +85,38 @@ Execute directly as a Python module:
 python -m reddit_dl.extractor --config config.json <urls>
 ```
 
+## Updating
+
+### Update Development Installation
+
+If you installed using the development method (`git clone` + `pip install -e .`):
+
+```bash
+cd reddit-dl
+git pull origin main
+python -m pip install -e . --upgrade
+```
+
+### Update Direct GitHub Installation
+
+If you installed directly from GitHub:
+
+```bash
+python -m pip install --upgrade "git+https://github.com/qasimbilalstack/reddit-dl.git"
+```
+
+### Update pipx Installation
+
+```bash
+pipx upgrade reddit-dl
+```
+
+Or reinstall to ensure latest version:
+```bash
+pipx uninstall reddit-dl
+pipx install git+https://github.com/qasimbilalstack/reddit-dl.git
+```
+
 ## Quickstart
 
 ### 1. Create Reddit Application
