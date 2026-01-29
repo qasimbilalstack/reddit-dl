@@ -385,7 +385,19 @@ def collect_media_from_post(post: Dict) -> Set[str]:
     except Exception:
         pass
 
-    # Priority 2: reddit_video_preview fallback (direct reddit MP4)
+    # Priority 2: reddit_video (native Reddit video in secure_media/media)
+    try:
+        sm = data.get("secure_media") or data.get("media")
+        if isinstance(sm, dict):
+            rv = sm.get("reddit_video")
+            if isinstance(rv, dict):
+                fb = rv.get("fallback_url")
+                if fb:
+                    return {fb.replace("&amp;", "&")}
+    except Exception:
+        pass
+
+    # Priority 2.5: reddit_video_preview fallback (direct reddit MP4 in preview)
     try:
         rv = data.get("preview", {}).get("reddit_video_preview")
         if isinstance(rv, dict):
@@ -395,7 +407,7 @@ def collect_media_from_post(post: Dict) -> Set[str]:
     except Exception:
         pass
 
-    # Priority 2.5: prefer preview MP4 variant for GIFs (preview.images[].variants.mp4)
+    # Priority 3: prefer preview MP4 variant for GIFs (preview.images[].variants.mp4)
     try:
         preview = data.get("preview", {})
         images = preview.get("images", []) if isinstance(preview, dict) else []
@@ -412,7 +424,7 @@ def collect_media_from_post(post: Dict) -> Set[str]:
     except Exception:
         pass
 
-    # Priority 3: direct fields (sometimes contain direct links)
+    # Priority 4: direct fields (sometimes contain direct links)
     for key in ("url_overridden_by_dest", "url"):
         u = data.get(key)
         if u and isinstance(u, str):
@@ -452,7 +464,7 @@ def collect_media_from_post(post: Dict) -> Set[str]:
                 pass
             return {u.replace("&amp;", "&")}
 
-    # Priority 4: galleries -> return highest-resolution image per gallery item (if no video found)
+    # Priority 5: galleries -> return highest-resolution image per gallery item (if no video found)
     try:
         mm = data.get("media_metadata")
         if isinstance(mm, dict) and mm:
@@ -485,7 +497,7 @@ def collect_media_from_post(post: Dict) -> Set[str]:
     except Exception:
         pass
 
-    # Priority 5: preview images (last resort)
+    # Priority 6: preview images (last resort)
     try:
         preview = data.get("preview", {})
         images = preview.get("images", [])
